@@ -111,9 +111,6 @@ local wheelBurst = 1
 local selectedWheelId = "Auto Detect"
 local lastWheelTick = 0
 
-local questClaimDelay = 0.5
-local lastQuestClaimTick = 0
-
 local selectedSaveName = "Save1"
 local saveFolder = "UnboxingHub/Saves"
 
@@ -759,17 +756,10 @@ local function spinSelectedWheel()
     end)
 end
 
-local function claimAllQuestLike()
-    pcall(function() if RE:FindFirstChild("ClaimDungeonQuest") then RE.ClaimDungeonQuest:FireServer() end end)
-    pcall(function() if RE:FindFirstChild("ClaimAllAchievements") then RE.ClaimAllAchievements:FireServer() end end)
-    pcall(function() if RE:FindFirstChild("ClaimLoginReward") then RE.ClaimLoginReward:FireServer() end end)
-
-    for i = 1, 30 do
-        pcall(function() if RE:FindFirstChild("ClaimPlaytimeReward") then RE.ClaimPlaytimeReward:FireServer(i) end end)
-        pcall(function() if RE:FindFirstChild("ClaimBattlePassTask") then RE.ClaimBattlePassTask:FireServer(i) end end)
-        pcall(function() if RE:FindFirstChild("ClaimQuest") then RE.ClaimQuest:FireServer(i) end end)
-        pcall(function() if RE:FindFirstChild("ClaimTask") then RE.ClaimTask:FireServer(i) end end)
-    end
+local function claimDamageQuest()
+    pcall(function()
+        RE.CollectQuest:FireServer("Damage")
+    end)
 end
 
 local function sendWebhookForce(message)
@@ -1038,7 +1028,7 @@ RewardsTab:CreateToggle({ Name = I.money .. " Auto Claim", CurrentValue = false,
 RewardsTab:CreateToggle({ Name = I.attack .. " Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
 RewardsTab:CreateToggle({ Name = I.gift .. " Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
 RewardsTab:CreateToggle({ Name = I.star .. " Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
-RewardsTab:CreateToggle({ Name = I.check .. " Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
+RewardsTab:CreateToggle({ Name = I.check .. " ClaimDamegeQuest", CurrentValue = false, Flag = "ClaimDamegeQuest", Callback = function(v) State.autoQuestClaim = v end })
 
 CratesTab:CreateSection(I.box .. " Crates")
 
@@ -1400,10 +1390,9 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while task.wait(0.1) do
-        if State.autoQuestClaim and os.clock() - lastQuestClaimTick >= questClaimDelay then
-            lastQuestClaimTick = os.clock()
-            claimAllQuestLike()
+    while task.wait(0.5) do
+        if State.autoQuestClaim then
+            claimDamageQuest()
         end
     end
 end)
@@ -1540,4 +1529,4 @@ pcall(function()
     end
 end)
 
-notify(I.gift .. " Unboxing Hub", "GUI refeito e carregado.", 4)
+notify(I.gift .. " Unboxing Hub", "GUI carregado com ClaimDamegeQuest.", 4)
