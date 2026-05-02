@@ -29,6 +29,30 @@ local Clock = require(ReplicatedStorage.Shared.Clock)
 local BoxController = require(ReplicatedStorage.Controllers.BoxController)
 local StateUtil = require(ReplicatedStorage.Shared.StateUtil)
 
+local I = {
+    box = utf8.char(0x1F4E6),
+    gift = utf8.char(0x1F381),
+    event = utf8.char(0x1F389),
+    money = utf8.char(0x1F4B0),
+    shield = utf8.char(0x1F6E1),
+    attack = utf8.char(0x2694),
+    sell = utf8.char(0x1F4B8),
+    map = utf8.char(0x1F5FA),
+    wheel = utf8.char(0x1F3A1),
+    quest = utf8.char(0x1F4DC),
+    bell = utf8.char(0x1F514),
+    stats = utf8.char(0x1F4CA),
+    eye = utf8.char(0x1F441),
+    gear = utf8.char(0x2699),
+    star = utf8.char(0x2B50),
+    egg = utf8.char(0x1F95A),
+    hat = utf8.char(0x1F3A9),
+    pet = utf8.char(0x1F43E),
+    check = utf8.char(0x2705),
+    x = utf8.char(0x274C),
+    bomb = utf8.char(0x1F4A3),
+}
+
 local State = {
     autoGoldRush = false,
     autoEasterRush = false,
@@ -39,35 +63,20 @@ local State = {
     autoDaily = false,
     autoAch = false,
     autoPerk = false,
-
     autoSellHats = false,
     autoSellPets = false,
     autoSellPerks = false,
-
     autoAttackBoxes = false,
     autoAttackCameraLock = false,
     autoWheel = false,
     autoQuestClaim = false,
     webhookEnabled = false,
-
     camLock = false,
     tpCamera = false,
-
-    autoEasterCrate = false,
-    autoHatDropBoost = false,
-    autoComumEventPotion = false,
-    autoRareEventPotion = false,
-    autoEpicEventPotion = false,
-    autoLegendaryEventPotion = false,
-    autoGodlyEventPotion = false,
-    autoMythicEventPotion = false,
-    autoMoleBoost = false,
-    autoEventBooster = false,
 }
 
 local crateAmount = 1
 local autoRushWorld = 108
-
 local autoAttackRange = 65
 local autoAttackDelay = 0.05
 local autoSellDelay = 5
@@ -88,11 +97,11 @@ local lastWheelTick = 0
 local questClaimDelay = 0.5
 local lastQuestClaimTick = 0
 
-local merchantScanDelay = 0.75
+local merchantScanDelay = 0.25
 local merchantLastScan = 0
-local merchantBoughtCache = {}
 local merchantSelectedItems = {}
-local merchantAutoBuyAllCrates = false
+local merchantBoughtCache = {}
+local merchantAutoBuyEnabled = false
 
 local camConn
 local camAttackConn
@@ -116,18 +125,14 @@ local farmPointIndex = 1
 local Stats = {
     startedAt = os.clock(),
     boxesBroken = 0,
-
     itemsSold = 0,
     hatsSold = 0,
     petsSold = 0,
     perksSold = 0,
-
     rushesDone = 0,
     rushesByName = {},
-
     cratesOpened = 0,
     cratesByName = {},
-
     eggRainGained = 0,
     bombRainGained = 0,
     ticketsGained = 0,
@@ -146,13 +151,27 @@ local rarityAliases = {
     Ethereum = "Etherium",
 }
 
+local merchantItems = {
+    "Easter2024Crate",
+    "BasicPerkCrate",
+    "HatDropBoost",
+    "ComumEventPotion",
+    "RareEventPotion",
+    "EpicEventPotion",
+    "LegendaryEventPotion",
+    "GodlyEventPotion",
+    "MythicEventPotion",
+    "MoleBoost",
+    "EventBooster",
+}
+
 local blur = Instance.new("BlurEffect")
 blur.Size = 0
 blur.Parent = Lighting
 
 local Window = Rayfield:CreateWindow({
-    Name = "Unboxing Hub V1",
-    LoadingTitle = "Unboxing Hub",
+    Name = I.gift .. " Unboxing Hub V1",
+    LoadingTitle = I.box .. " Unboxing Hub",
     LoadingSubtitle = "by DrSkrr",
     ConfigurationSaving = {
         Enabled = true,
@@ -167,19 +186,19 @@ local Window = Rayfield:CreateWindow({
     KeySystem = false,
 })
 
-local FarmTab = Window:CreateTab("Farm", 4483362458)
-local EventTab = Window:CreateTab("Event", 4483362458)
-local RewardsTab = Window:CreateTab("Rewards", 4483362458)
-local CratesTab = Window:CreateTab("Crates", 4483362458)
-local AutoSellTab = Window:CreateTab("Auto Sell", 4483362458)
-local AutoAttackTab = Window:CreateTab("Auto Attack", 4483362458)
-local AreaFarmTab = Window:CreateTab("Area Farm", 4483362458)
-local WheelTab = Window:CreateTab("Wheel", 4483362458)
-local QuestTab = Window:CreateTab("Quest", 4483362458)
-local WebhookTab = Window:CreateTab("Webhook", 4483362458)
-local StatsTab = Window:CreateTab("Stats", 4483362458)
-local VisualTab = Window:CreateTab("Visual", 4483362458)
-local OtherTab = Window:CreateTab("Other", 4483362458)
+local FarmTab = Window:CreateTab(I.box .. " Farm", 4483362458)
+local EventTab = Window:CreateTab(I.event .. " Event", 4483362458)
+local RewardsTab = Window:CreateTab(I.gift .. " Rewards", 4483362458)
+local CratesTab = Window:CreateTab(I.box .. " Crates", 4483362458)
+local AutoSellTab = Window:CreateTab(I.sell .. " Auto Sell", 4483362458)
+local AutoAttackTab = Window:CreateTab(I.attack .. " Auto Attack", 4483362458)
+local AreaFarmTab = Window:CreateTab(I.map .. " Area Farm", 4483362458)
+local WheelTab = Window:CreateTab(I.wheel .. " Wheel", 4483362458)
+local QuestTab = Window:CreateTab(I.quest .. " Quest", 4483362458)
+local WebhookTab = Window:CreateTab(I.bell .. " Webhook", 4483362458)
+local StatsTab = Window:CreateTab(I.stats .. " Stats", 4483362458)
+local VisualTab = Window:CreateTab(I.eye .. " Visual", 4483362458)
+local OtherTab = Window:CreateTab(I.gear .. " Other", 4483362458)
 
 local function notify(title, content, duration)
     pcall(function()
@@ -203,33 +222,26 @@ end
 local function countDict(tbl)
     local count = 0
     for _ in pairs(tbl or {}) do
-        count += 1
+        count = count + 1
     end
     return count
 end
 
 local function getItemData(invItem)
     if not invItem or not invItem.ItemId then return nil end
-
     local ok, data = pcall(function()
         return ItemData.Get(invItem.ItemId)
     end)
-
     if ok then return data end
     return nil
 end
 
 local function getRarityName(itemData)
     if not itemData or not itemData.Rarity then return nil end
-
     local ok, rarityName = pcall(function()
         return ItemData.GetRawRarityName(itemData.Rarity)
     end)
-
-    if ok then
-        return rarityAliases[rarityName] or rarityName
-    end
-
+    if ok then return rarityAliases[rarityName] or rarityName end
     return nil
 end
 
@@ -274,15 +286,11 @@ local function getBestPerkStat(invItem)
         key = string.lower(tostring(key or ""))
 
         for blocked in pairs(blockedKeys) do
-            if key:find(blocked) then
-                return false
-            end
+            if key:find(blocked) then return false end
         end
 
         for allowed in pairs(allowedKeys) do
-            if key:find(allowed) then
-                return true
-            end
+            if key:find(allowed) then return true end
         end
 
         return false
@@ -291,9 +299,7 @@ local function getBestPerkStat(invItem)
     local function scan(value, key)
         if type(value) == "number" then
             if keyAllowed(key) and value >= perkFavoriteMinStat and value <= 100 then
-                if value > best then
-                    best = value
-                end
+                if value > best then best = value end
             end
         elseif type(value) == "table" then
             for k, v in pairs(value) do
@@ -305,16 +311,13 @@ local function getBestPerkStat(invItem)
     scan(invItem, "root")
 
     local data = getItemData(invItem)
-    if data then
-        scan(data, "itemData")
-    end
+    if data then scan(data, "itemData") end
 
     return best
 end
 
 local function isRareDrop(invItem)
     if not invItem then return false end
-
     local txt = string.lower(tostring(invItem.ItemId or invItem.Id or invItem.Name or ""))
 
     return txt:find("eggrain")
@@ -417,12 +420,11 @@ local function sellInventoryCategory(category)
     end)
 
     if ok and result then
-        Stats.itemsSold += #list
-        if category == "Hats" then Stats.hatsSold += #list end
-        if category == "Pets" then Stats.petsSold += #list end
-        if category == "Perks" then Stats.perksSold += #list end
-
-        notify("Auto Sell", "Vendeu " .. tostring(#list) .. " " .. category, 2)
+        Stats.itemsSold = Stats.itemsSold + #list
+        if category == "Hats" then Stats.hatsSold = Stats.hatsSold + #list end
+        if category == "Pets" then Stats.petsSold = Stats.petsSold + #list end
+        if category == "Perks" then Stats.perksSold = Stats.perksSold + #list end
+        notify(I.check .. " Auto Sell", "Vendeu " .. tostring(#list) .. " " .. category, 2)
     end
 end
 
@@ -501,11 +503,9 @@ local function buildRoutePoints(center, radius, step)
 
         if math.floor((x + radius) / step) % 2 == 1 then
             local rev = {}
-
             for i = #row, 1, -1 do
                 table.insert(rev, row[i])
             end
-
             row = rev
         end
 
@@ -533,9 +533,7 @@ local function getAreaModel(index)
             return true
         end
 
-        local attrs = { "Id", "ID", "AreaId", "AreaID", "World", "WorldId", "WorldID", "Index" }
-
-        for _, attr in ipairs(attrs) do
+        for _, attr in ipairs({ "Id", "ID", "AreaId", "AreaID", "World", "WorldId", "WorldID", "Index" }) do
             local ok, value = pcall(function()
                 return inst:GetAttribute(attr)
             end)
@@ -549,16 +547,12 @@ local function getAreaModel(index)
     end
 
     for _, inst in ipairs(areas:GetChildren()) do
-        if areaMatches(inst) then
-            return inst
-        end
+        if areaMatches(inst) then return inst end
     end
 
     for _, inst in ipairs(areas:GetDescendants()) do
         if inst:IsA("Model") or inst:IsA("Folder") then
-            if areaMatches(inst) then
-                return inst
-            end
+            if areaMatches(inst) then return inst end
         end
     end
 
@@ -568,17 +562,7 @@ end
 local function getModelCenter(model)
     if not model then return nil end
 
-    local preferredNames = {
-        "Center",
-        "Spawn",
-        "Teleport",
-        "Hitbox",
-        "Field",
-        "Zone",
-        "Base",
-    }
-
-    for _, name in ipairs(preferredNames) do
+    for _, name in ipairs({ "Center", "Spawn", "Teleport", "Hitbox", "Field", "Zone", "Base" }) do
         local inst = model:FindFirstChild(name, true)
 
         if inst and inst:IsA("BasePart") then
@@ -587,10 +571,7 @@ local function getModelCenter(model)
             local ok, cf = pcall(function()
                 return inst:GetPivot()
             end)
-
-            if ok and cf then
-                return cf.Position
-            end
+            if ok and cf then return cf.Position end
         end
     end
 
@@ -598,9 +579,7 @@ local function getModelCenter(model)
         return model:GetPivot()
     end)
 
-    if ok and cf then
-        return cf.Position
-    end
+    if ok and cf then return cf.Position end
 
     local part = model:FindFirstChildWhichIsA("BasePart", true)
     return part and part.Position or nil
@@ -629,7 +608,7 @@ local function startTPCameraRoute()
         local flatT = Vector3.new(target.X, lockedCameraCenter.Y, target.Z)
 
         if (flatR - flatT).Magnitude <= 8 then
-            routeIndex += 1
+            routeIndex = routeIndex + 1
             if routeIndex > #routePoints then routeIndex = 1 end
             target = routePoints[routeIndex]
         end
@@ -649,7 +628,7 @@ local function startFarmAreaRoute()
     farmAreaCenter = getModelCenter(area)
 
     if not farmAreaCenter then
-        notify("Area Farm", "Area nao encontrada: " .. tostring(farmAreaIndex), 3)
+        notify(I.x .. " Area Farm", "Area nao encontrada: " .. tostring(farmAreaIndex), 3)
         return
     end
 
@@ -674,7 +653,7 @@ local function startFarmAreaRoute()
         local flatT = Vector3.new(target.X, farmAreaCenter.Y, target.Z)
 
         if (flatR - flatT).Magnitude <= 8 then
-            farmPointIndex += 1
+            farmPointIndex = farmPointIndex + 1
             if farmPointIndex > #farmPoints then farmPointIndex = 1 end
             target = farmPoints[farmPointIndex]
         end
@@ -682,7 +661,7 @@ local function startFarmAreaRoute()
         h:MoveTo(target)
     end)
 
-    notify("Area Farm", "Farmando area " .. tostring(farmAreaIndex), 3)
+    notify(I.check .. " Area Farm", "Farmando area " .. tostring(farmAreaIndex), 3)
 end
 
 local function stopFarmAreaRoute()
@@ -722,13 +701,12 @@ local function forceActivateEquippedPerks()
         pcall(function()
             RE.ActivatePerk:FireServer(id)
         end)
-
         task.wait(0.15)
     end
 end
 
 local function recordRush(name)
-    Stats.rushesDone += 1
+    Stats.rushesDone = Stats.rushesDone + 1
     Stats.rushesByName[name] = (Stats.rushesByName[name] or 0) + 1
 end
 
@@ -737,22 +715,22 @@ local function trackCrateReward(value)
         local s = string.lower(value)
 
         if s:find("eggrain") or s:find("egg rain") then
-            Stats.eggRainGained += 1
+            Stats.eggRainGained = Stats.eggRainGained + 1
         end
 
         if s:find("bombrain") or s:find("bomb rain") or s:find("bomb%-rain") then
-            Stats.bombRainGained += 1
+            Stats.bombRainGained = Stats.bombRainGained + 1
         end
 
         if s:find("ticket") then
-            Stats.ticketsGained += 1
+            Stats.ticketsGained = Stats.ticketsGained + 1
         end
     elseif type(value) == "table" then
         for k, v in pairs(value) do
             local key = string.lower(tostring(k))
 
             if key:find("ticket") and type(v) == "number" then
-                Stats.ticketsGained += v
+                Stats.ticketsGained = Stats.ticketsGained + v
             end
 
             trackCrateReward(k)
@@ -769,7 +747,7 @@ local function openCrateAndTrack(crateId, amount)
     end)
 
     if ok then
-        Stats.cratesOpened += amount
+        Stats.cratesOpened = Stats.cratesOpened + amount
         Stats.cratesByName[crateId] = (Stats.cratesByName[crateId] or 0) + amount
         trackCrateReward(result)
     end
@@ -839,22 +817,26 @@ end
 local function getMerchantData()
     if not RF:FindFirstChild("GetMerchantData") then return nil end
 
-    local ok, data = pcall(function()
-        return RF.GetMerchantData:InvokeServer("MoleMerchant")
-    end)
+    local tries = {
+        function() return RF.GetMerchantData:InvokeServer("MoleMerchant") end,
+        function() return RF.GetMerchantData:InvokeServer({ MerchantId = "MoleMerchant" }) end,
+        function() return RF.GetMerchantData:InvokeServer() end,
+    }
 
-    if ok then return data end
+    for _, fn in ipairs(tries) do
+        local ok, data = pcall(fn)
+        if ok and type(data) == "table" then return data end
+    end
+
     return nil
 end
 
 local function collectMerchantItems(data, found)
     found = found or {}
 
-    if type(data) ~= "table" then
-        return found
-    end
+    if type(data) ~= "table" then return found end
 
-    local itemId = data.ItemId or data.ItemID or data.Id or data.ID
+    local itemId = data.ItemId or data.ItemID or data.Id or data.ID or data.Name
 
     if itemId then
         table.insert(found, data)
@@ -876,6 +858,8 @@ local function merchantItemAvailable(item)
     if item.IsSoldOut == true then return false end
     if item.Purchased == true then return false end
     if item.Bought == true then return false end
+    if item.CanBuy == false then return false end
+    if item.Available == false then return false end
 
     local stock = item.Stock or item.Amount or item.Quantity or item.Remaining or item.Left
 
@@ -886,54 +870,46 @@ local function merchantItemAvailable(item)
     return true
 end
 
-local function shouldBuyMerchantItem(item)
-    local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or "")
-    local lower = string.lower(itemId)
-
-    if itemId == "" then return false end
-
-    if merchantAutoBuyAllCrates and lower:find("crate") then
-        return true
-    end
-
-    return merchantSelectedItems[itemId] == true
-end
-
 local function merchantSignature(item)
-    local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or "")
+    local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or item.Name or "")
     local stock = tostring(item.Stock or item.Amount or item.Quantity or item.Remaining or item.Left or "")
     local price = tostring(item.Price or item.Cost or item.CostAmount or "")
-    local reset = tostring(item.RefreshAt or item.ResetAt or item.RestockAt or "")
+    local reset = tostring(item.RefreshAt or item.ResetAt or item.RestockAt or item.RestockTime or "")
 
     return itemId .. "|" .. stock .. "|" .. price .. "|" .. reset
 end
 
+local function buyMerchantItem(itemId)
+    local ok = pcall(function()
+        RF.PurchaseMerchantItem:InvokeServer({
+            ItemId = itemId,
+            MerchantId = "MoleMerchant",
+        })
+    end)
+
+    if ok then
+        Stats.merchantBought = Stats.merchantBought + 1
+    end
+end
+
 local function buyMerchantSelectedOnce()
+    if not merchantAutoBuyEnabled then return end
+
     local data = getMerchantData()
     if not data then return end
 
-    local items = collectMerchantItems(data)
+    local foundItems = collectMerchantItems(data)
 
-    for _, item in ipairs(items) do
-        local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or "")
+    for _, item in ipairs(foundItems) do
+        local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or item.Name or "")
 
-        if itemId ~= "" and merchantItemAvailable(item) and shouldBuyMerchantItem(item) then
+        if merchantSelectedItems[itemId] and merchantItemAvailable(item) then
             local sig = merchantSignature(item)
 
             if not merchantBoughtCache[sig] then
                 merchantBoughtCache[sig] = true
-
                 task.spawn(function()
-                    local ok = pcall(function()
-                        RF.PurchaseMerchantItem:InvokeServer({
-                            ItemId = itemId,
-                            MerchantId = "MoleMerchant",
-                        })
-                    end)
-
-                    if ok then
-                        Stats.merchantBought += 1
-                    end
+                    buyMerchantItem(itemId)
                 end)
             end
         end
@@ -942,14 +918,14 @@ end
 
 local function sendWebhook(message)
     if webhookUrl == "" then
-        notify("Webhook", "Coloque a URL primeiro.", 3)
+        notify(I.bell .. " Webhook", "Coloque a URL primeiro.", 3)
         return
     end
 
     local req = http_request or request or syn and syn.request or fluxus and fluxus.request
 
     if not req then
-        notify("Webhook", "Executor sem request/http_request.", 4)
+        notify(I.x .. " Webhook", "Executor sem request/http_request.", 4)
         return
     end
 
@@ -1005,14 +981,14 @@ pcall(function()
             count = buffer.len(boxBuffer) // 2
         end)
 
-        Stats.boxesBroken += count
+        Stats.boxesBroken = Stats.boxesBroken + count
     end)
 end)
 
-FarmTab:CreateSection("Farm")
+FarmTab:CreateSection(I.money .. " Farm")
 
 FarmTab:CreateInput({
-    Name = "Mundo do Auto Gold Rush",
+    Name = I.box .. " Mundo do Auto Gold Rush",
     PlaceholderText = "Ex: 108",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1021,14 +997,14 @@ FarmTab:CreateInput({
     end,
 })
 
-FarmTab:CreateToggle({ Name = "Auto Gold Rush", CurrentValue = false, Flag = "AutoGoldRush", Callback = function(v) State.autoGoldRush = v end })
-FarmTab:CreateToggle({ Name = "Auto Easter Rush", CurrentValue = false, Flag = "AutoEasterRush", Callback = function(v) State.autoEasterRush = v end })
-FarmTab:CreateToggle({ Name = "Auto Close", CurrentValue = false, Flag = "AutoClose", Callback = function(v) State.autoClose = v end })
-FarmTab:CreateToggle({ Name = "Auto Close Rush Results", CurrentValue = false, Flag = "AutoCloseRushResults", Callback = function(v) State.autoCloseRushResults = v end })
-FarmTab:CreateToggle({ Name = "NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
+FarmTab:CreateToggle({ Name = I.money .. " Auto Gold Rush", CurrentValue = false, Flag = "AutoGoldRush", Callback = function(v) State.autoGoldRush = v end })
+FarmTab:CreateToggle({ Name = I.egg .. " Auto Easter Rush", CurrentValue = false, Flag = "AutoEasterRush", Callback = function(v) State.autoEasterRush = v end })
+FarmTab:CreateToggle({ Name = I.x .. " Auto Close", CurrentValue = false, Flag = "AutoClose", Callback = function(v) State.autoClose = v end })
+FarmTab:CreateToggle({ Name = I.check .. " Auto Close Rush Results", CurrentValue = false, Flag = "AutoCloseRushResults", Callback = function(v) State.autoCloseRushResults = v end })
+FarmTab:CreateToggle({ Name = I.shield .. " NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
 
 FarmTab:CreateButton({
-    Name = "BOMB RAIN",
+    Name = I.bomb .. " BOMB RAIN",
     Callback = function()
         pcall(function()
             RE.PromptProductPurchase:FireServer("BombRainInstant")
@@ -1036,36 +1012,30 @@ FarmTab:CreateButton({
     end,
 })
 
-EventTab:CreateSection("Mole Merchant Auto Buy")
+EventTab:CreateSection(I.event .. " Mole Merchant Auto Buy")
 
 EventTab:CreateToggle({
-    Name = "Auto Buy Todas as Crates",
+    Name = I.check .. " Ativar Auto Buy Merchant",
     CurrentValue = false,
-    Flag = "MerchantAllCrates",
+    Flag = "MerchantAutoBuyEnabled",
     Callback = function(Value)
-        merchantAutoBuyAllCrates = Value
+        merchantAutoBuyEnabled = Value
     end,
 })
 
-local merchantCrates = {
-    "Easter2024Crate",
-    "MaterialCrate",
-    "BasicPerkCrate",
-    "BoxPerkCrate",
-    "DungeonCrateWorld1",
-    "DungeonCrateWorld2",
-    "DungeonCrateWorld3",
-    "ExclusiveEasterCrate",
-    "ExclusivePerkCrate",
-    "ExclusiveSummerCrate",
-    "ExclusiveWinterCrate",
-    "ExclusiveHalloweenCrate",
-    "ExclusiveValentinesCrate",
-}
+EventTab:CreateInput({
+    Name = I.gear .. " Delay Scan Merchant",
+    PlaceholderText = "Padrao: 0.25",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        local n = tonumber(Text)
+        if n and n >= 0.1 then merchantScanDelay = n end
+    end,
+})
 
-for _, itemId in ipairs(merchantCrates) do
+for _, itemId in ipairs(merchantItems) do
     EventTab:CreateToggle({
-        Name = "Comprar " .. itemId,
+        Name = I.gift .. " Comprar " .. itemId,
         CurrentValue = false,
         Flag = "Merchant_" .. itemId,
         Callback = function(Value)
@@ -1074,29 +1044,37 @@ for _, itemId in ipairs(merchantCrates) do
     })
 end
 
-EventTab:CreateSection("Mole Merchant Itens")
+EventTab:CreateButton({
+    Name = I.money .. " Comprar Selecionados Agora",
+    Callback = function()
+        for _, itemId in ipairs(merchantItems) do
+            if merchantSelectedItems[itemId] then
+                task.spawn(function()
+                    buyMerchantItem(itemId)
+                end)
+            end
+        end
+    end,
+})
 
-EventTab:CreateToggle({ Name = "EasterCrate", CurrentValue = false, Flag = "EasterCrate", Callback = function(v) State.autoEasterCrate = v end })
-EventTab:CreateToggle({ Name = "HatDropBoost", CurrentValue = false, Flag = "HatDropBoost", Callback = function(v) State.autoHatDropBoost = v end })
-EventTab:CreateToggle({ Name = "ComumEventPotion", CurrentValue = false, Flag = "ComumEventPotion", Callback = function(v) State.autoComumEventPotion = v end })
-EventTab:CreateToggle({ Name = "RareEventPotion", CurrentValue = false, Flag = "RareEventPotion", Callback = function(v) State.autoRareEventPotion = v end })
-EventTab:CreateToggle({ Name = "EpicEventPotion", CurrentValue = false, Flag = "EpicEventPotion", Callback = function(v) State.autoEpicEventPotion = v end })
-EventTab:CreateToggle({ Name = "LegendaryEventPotion", CurrentValue = false, Flag = "LegendaryEventPotion", Callback = function(v) State.autoLegendaryEventPotion = v end })
-EventTab:CreateToggle({ Name = "GodlyEventPotion", CurrentValue = false, Flag = "GodlyEventPotion", Callback = function(v) State.autoGodlyEventPotion = v end })
-EventTab:CreateToggle({ Name = "MythicEventPotion", CurrentValue = false, Flag = "MythicEventPotion", Callback = function(v) State.autoMythicEventPotion = v end })
-EventTab:CreateToggle({ Name = "MoleBoost", CurrentValue = false, Flag = "MoleBoost", Callback = function(v) State.autoMoleBoost = v end })
-EventTab:CreateToggle({ Name = "EventBooster", CurrentValue = false, Flag = "EventBooster", Callback = function(v) State.autoEventBooster = v end })
+EventTab:CreateButton({
+    Name = I.gear .. " Limpar Cache Merchant",
+    Callback = function()
+        merchantBoughtCache = {}
+        notify(I.check .. " Merchant", "Cache limpo.", 2)
+    end,
+})
 
-RewardsTab:CreateSection("Rewards")
-RewardsTab:CreateToggle({ Name = "Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(v) State.autoClaim = v end })
-RewardsTab:CreateToggle({ Name = "Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
-RewardsTab:CreateToggle({ Name = "Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
-RewardsTab:CreateToggle({ Name = "Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
+RewardsTab:CreateSection(I.gift .. " Rewards")
+RewardsTab:CreateToggle({ Name = I.money .. " Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(v) State.autoClaim = v end })
+RewardsTab:CreateToggle({ Name = I.attack .. " Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
+RewardsTab:CreateToggle({ Name = I.gift .. " Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
+RewardsTab:CreateToggle({ Name = I.star .. " Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
 
-CratesTab:CreateSection("Crates")
+CratesTab:CreateSection(I.box .. " Crates")
 
 CratesTab:CreateInput({
-    Name = "Quantidade",
+    Name = I.box .. " Quantidade",
     PlaceholderText = "Ex: 10",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1107,7 +1085,7 @@ CratesTab:CreateInput({
 
 local function crateButton(name, crateId)
     CratesTab:CreateButton({
-        Name = name,
+        Name = I.box .. " " .. name,
         Callback = function()
             openCrateAndTrack(crateId, crateAmount)
         end,
@@ -1116,19 +1094,18 @@ end
 
 crateButton("EasterCrate", "Easter2024Crate")
 crateButton("MaterialCrate", "MaterialCrate")
-crateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
-crateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
 crateButton("BasicPerk", "BasicPerkCrate")
 crateButton("BoxPerk", "BoxPerkCrate")
 crateButton("ExclusiveEasterCrate", "ExclusiveEasterCrate")
+crateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
+crateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
 
-AutoSellTab:CreateSection("Protecao")
-
-AutoSellTab:CreateToggle({ Name = "Favoritar EggRain/BombRain", CurrentValue = true, Flag = "AutoFavoriteRareDrops", Callback = function(v) autoFavoriteRareDrops = v end })
-AutoSellTab:CreateToggle({ Name = "Favoritar Perks bons", CurrentValue = true, Flag = "AutoFavoriteGoodPerks", Callback = function(v) autoFavoriteGoodPerks = v end })
+AutoSellTab:CreateSection(I.shield .. " Protecao")
+AutoSellTab:CreateToggle({ Name = I.bomb .. " Favoritar EggRain/BombRain", CurrentValue = true, Flag = "AutoFavoriteRareDrops", Callback = function(v) autoFavoriteRareDrops = v end })
+AutoSellTab:CreateToggle({ Name = I.star .. " Favoritar Perks bons", CurrentValue = true, Flag = "AutoFavoriteGoodPerks", Callback = function(v) autoFavoriteGoodPerks = v end })
 
 AutoSellTab:CreateInput({
-    Name = "Stat minimo do Perk",
+    Name = I.star .. " Stat minimo do Perk",
     PlaceholderText = "Padrao: 4.0",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1138,7 +1115,7 @@ AutoSellTab:CreateInput({
 })
 
 AutoSellTab:CreateInput({
-    Name = "Delay Auto Sell",
+    Name = I.gear .. " Delay Auto Sell",
     PlaceholderText = "Padrao: 5",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1149,11 +1126,11 @@ AutoSellTab:CreateInput({
 
 local rarityOrder = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic", "Etherium", "Celestial" }
 
-local function rarityToggles(category)
-    AutoSellTab:CreateSection("Sell " .. category)
+local function rarityToggles(category, icon)
+    AutoSellTab:CreateSection(icon .. " Sell " .. category)
 
     AutoSellTab:CreateToggle({
-        Name = "Ativar Auto Sell " .. category,
+        Name = I.sell .. " Ativar Auto Sell " .. category,
         CurrentValue = false,
         Flag = "AutoSell" .. category,
         Callback = function(v)
@@ -1173,34 +1150,18 @@ local function rarityToggles(category)
     end
 end
 
-rarityToggles("Hats")
-rarityToggles("Pets")
-rarityToggles("Perks")
+rarityToggles("Hats", I.hat)
+rarityToggles("Pets", I.pet)
+rarityToggles("Perks", I.star)
 
-AutoSellTab:CreateButton({
-    Name = "Proteger Agora",
-    Callback = function()
-        protectSpecialItems()
-        notify("Protecao", "Verificado.", 2)
-    end,
-})
+AutoSellTab:CreateButton({ Name = I.shield .. " Proteger Agora", Callback = function() protectSpecialItems() notify(I.check .. " Protecao", "Verificado.", 2) end })
+AutoSellTab:CreateButton({ Name = I.sell .. " Vender Agora", Callback = function() protectSpecialItems() sellInventoryCategory("Hats") sellInventoryCategory("Pets") sellInventoryCategory("Perks") end })
 
-AutoSellTab:CreateButton({
-    Name = "Vender Agora",
-    Callback = function()
-        protectSpecialItems()
-        sellInventoryCategory("Hats")
-        sellInventoryCategory("Pets")
-        sellInventoryCategory("Perks")
-    end,
-})
-
-AutoAttackTab:CreateSection("Auto Attack")
-
-AutoAttackTab:CreateToggle({ Name = "Auto Attack Aura", CurrentValue = false, Flag = "AutoAttackBoxes", Callback = function(v) State.autoAttackBoxes = v end })
+AutoAttackTab:CreateSection(I.attack .. " Auto Attack")
+AutoAttackTab:CreateToggle({ Name = I.attack .. " Auto Attack Aura", CurrentValue = false, Flag = "AutoAttackBoxes", Callback = function(v) State.autoAttackBoxes = v end })
 
 AutoAttackTab:CreateInput({
-    Name = "Distancia",
+    Name = I.attack .. " Distancia",
     PlaceholderText = "Padrao: 65",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1210,7 +1171,7 @@ AutoAttackTab:CreateInput({
 })
 
 AutoAttackTab:CreateInput({
-    Name = "Delay",
+    Name = I.gear .. " Delay",
     PlaceholderText = "Padrao: 0.05",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1220,7 +1181,7 @@ AutoAttackTab:CreateInput({
 })
 
 AutoAttackTab:CreateToggle({
-    Name = "Auto Attack Camera Lock",
+    Name = I.eye .. " Auto Attack Camera Lock",
     CurrentValue = false,
     Flag = "AutoAttackCameraLock",
     Callback = function(v)
@@ -1242,7 +1203,7 @@ AutoAttackTab:CreateToggle({
             camAttackConn = RunService.RenderStepped:Connect(function(dt)
                 if not State.autoAttackCameraLock then return end
 
-                angle += dt * 1.2
+                angle = angle + dt * 1.2
 
                 local x = math.cos(angle) * 10
                 local z = math.sin(angle) * 10
@@ -1261,10 +1222,10 @@ AutoAttackTab:CreateToggle({
     end,
 })
 
-AreaFarmTab:CreateSection("Area Farm")
+AreaFarmTab:CreateSection(I.map .. " Area Farm")
 
 AreaFarmTab:CreateInput({
-    Name = "Numero da Area",
+    Name = I.map .. " Numero da Area",
     PlaceholderText = "Ex: 1",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1274,7 +1235,7 @@ AreaFarmTab:CreateInput({
 })
 
 AreaFarmTab:CreateInput({
-    Name = "Raio",
+    Name = I.map .. " Raio",
     PlaceholderText = "Padrao: 90",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1284,7 +1245,7 @@ AreaFarmTab:CreateInput({
 })
 
 AreaFarmTab:CreateInput({
-    Name = "Espacamento",
+    Name = I.map .. " Espacamento",
     PlaceholderText = "Padrao: 28",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1293,18 +1254,10 @@ AreaFarmTab:CreateInput({
     end,
 })
 
-AreaFarmTab:CreateToggle({
-    Name = "Auto Farm Area + Attack",
-    CurrentValue = false,
-    Flag = "AutoFarmArea",
-    Callback = function(v)
-        autoFarmArea = v
-        if v then startFarmAreaRoute() else stopFarmAreaRoute() end
-    end,
-})
+AreaFarmTab:CreateToggle({ Name = I.attack .. " Auto Farm Area + Attack", CurrentValue = false, Flag = "AutoFarmArea", Callback = function(v) autoFarmArea = v if v then startFarmAreaRoute() else stopFarmAreaRoute() end end })
 
 AreaFarmTab:CreateButton({
-    Name = "Ir para Area",
+    Name = I.map .. " Ir para Area",
     Callback = function()
         local center = getModelCenter(getAreaModel(farmAreaIndex))
 
@@ -1313,15 +1266,15 @@ AreaFarmTab:CreateButton({
             local root = char:WaitForChild("HumanoidRootPart")
             root.CFrame = CFrame.new(center + Vector3.new(0, 4, 0))
         else
-            notify("Area Farm", "Area nao encontrada.", 2)
+            notify(I.x .. " Area Farm", "Area nao encontrada.", 2)
         end
     end,
 })
 
-WheelTab:CreateSection("Wheel")
+WheelTab:CreateSection(I.wheel .. " Wheel")
 
 WheelTab:CreateDropdown({
-    Name = "Wheel",
+    Name = I.wheel .. " Wheel",
     Options = { "Auto Detect", "Easter", "Default" },
     CurrentOption = { "Auto Detect" },
     MultipleOptions = false,
@@ -1331,55 +1284,21 @@ WheelTab:CreateDropdown({
     end,
 })
 
-WheelTab:CreateInput({
-    Name = "WheelId Manual",
-    PlaceholderText = "Opcional",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        if Text and Text ~= "" then selectedWheelId = Text end
-    end,
-})
+WheelTab:CreateInput({ Name = I.wheel .. " WheelId Manual", PlaceholderText = "Opcional", RemoveTextAfterFocusLost = false, Callback = function(Text) if Text and Text ~= "" then selectedWheelId = Text end end })
+WheelTab:CreateInput({ Name = I.gear .. " Delay Wheel", PlaceholderText = "Padrao: 0.03", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 0.01 then wheelDelay = n end end })
+WheelTab:CreateInput({ Name = I.wheel .. " Burst", PlaceholderText = "Padrao: 1", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 1 then wheelBurst = math.floor(n) end end })
+WheelTab:CreateToggle({ Name = I.wheel .. " Auto Wheel", CurrentValue = false, Flag = "AutoWheel", Callback = function(v) State.autoWheel = v end })
+WheelTab:CreateButton({ Name = I.wheel .. " Girar Agora", Callback = spinSelectedWheel })
 
-WheelTab:CreateInput({
-    Name = "Delay Wheel",
-    PlaceholderText = "Padrao: 0.03",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 0.01 then wheelDelay = n end
-    end,
-})
+QuestTab:CreateSection(I.quest .. " Quest")
+QuestTab:CreateInput({ Name = I.gear .. " Delay Claim", PlaceholderText = "Padrao: 0.5", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 0.1 then questClaimDelay = n end end })
+QuestTab:CreateToggle({ Name = I.quest .. " Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
+QuestTab:CreateButton({ Name = I.quest .. " Claim Agora", Callback = claimAllQuestLike })
 
-WheelTab:CreateInput({
-    Name = "Burst",
-    PlaceholderText = "Padrao: 1",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 1 then wheelBurst = math.floor(n) end
-    end,
-})
-
-WheelTab:CreateToggle({ Name = "Auto Wheel", CurrentValue = false, Flag = "AutoWheel", Callback = function(v) State.autoWheel = v end })
-WheelTab:CreateButton({ Name = "Girar Agora", Callback = spinSelectedWheel })
-
-QuestTab:CreateSection("Quest")
-QuestTab:CreateInput({
-    Name = "Delay Claim",
-    PlaceholderText = "Padrao: 0.5",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 0.1 then questClaimDelay = n end
-    end,
-})
-QuestTab:CreateToggle({ Name = "Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
-QuestTab:CreateButton({ Name = "Claim Agora", Callback = claimAllQuestLike })
-
-WebhookTab:CreateSection("Discord Webhook")
+WebhookTab:CreateSection(I.bell .. " Discord Webhook")
 
 WebhookTab:CreateInput({
-    Name = "Webhook URL",
+    Name = I.bell .. " Webhook URL",
     PlaceholderText = "Cole o webhook aqui",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1388,7 +1307,7 @@ WebhookTab:CreateInput({
 })
 
 WebhookTab:CreateInput({
-    Name = "Tempo em minutos",
+    Name = I.gear .. " Tempo em minutos",
     PlaceholderText = "Padrao: 60",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
@@ -1397,39 +1316,17 @@ WebhookTab:CreateInput({
     end,
 })
 
-WebhookTab:CreateToggle({
-    Name = "Ativar Webhook Automatico",
-    CurrentValue = false,
-    Flag = "WebhookEnabled",
-    Callback = function(v)
-        State.webhookEnabled = v
-        lastWebhookAt = os.clock()
-    end,
-})
+WebhookTab:CreateToggle({ Name = I.bell .. " Ativar Webhook Automatico", CurrentValue = false, Flag = "WebhookEnabled", Callback = function(v) State.webhookEnabled = v lastWebhookAt = os.clock() end })
+WebhookTab:CreateButton({ Name = I.check .. " Test Webhook", Callback = function() sendWebhook("Teste do Unboxing Hub - Player: " .. tostring(player.Name)) notify(I.bell .. " Webhook", "Teste enviado.", 2) end })
+WebhookTab:CreateButton({ Name = I.stats .. " Enviar Relatorio Agora", Callback = function() sendWebhook(buildWebhookReport()) notify(I.bell .. " Webhook", "Relatorio enviado.", 2) end })
 
-WebhookTab:CreateButton({
-    Name = "Test Webhook",
-    Callback = function()
-        sendWebhook("Teste do Unboxing Hub - Player: " .. tostring(player.Name))
-        notify("Webhook", "Teste enviado.", 2)
-    end,
-})
-
-WebhookTab:CreateButton({
-    Name = "Enviar Relatorio Agora",
-    Callback = function()
-        sendWebhook(buildWebhookReport())
-        notify("Webhook", "Relatorio enviado.", 2)
-    end,
-})
-
-StatsTab:CreateSection("Stats")
+StatsTab:CreateSection(I.stats .. " Stats")
 
 StatsTab:CreateButton({
-    Name = "Mostrar Stats",
+    Name = I.stats .. " Mostrar Stats",
     Callback = function()
         notify(
-            "Sessao",
+            I.stats .. " Sessao",
             "Tempo: " .. formatTime(os.clock() - Stats.startedAt)
                 .. " | Boxes: " .. tostring(Stats.boxesBroken)
                 .. " | Crates: " .. tostring(Stats.cratesOpened)
@@ -1440,10 +1337,10 @@ StatsTab:CreateButton({
     end,
 })
 
-VisualTab:CreateSection("Visual")
+VisualTab:CreateSection(I.eye .. " Visual")
 
 VisualTab:CreateToggle({
-    Name = "Camera Lock",
+    Name = I.eye .. " Camera Lock",
     CurrentValue = false,
     Flag = "CameraLock",
     Callback = function(v)
@@ -1465,7 +1362,7 @@ VisualTab:CreateToggle({
             camConn = RunService.RenderStepped:Connect(function(dt)
                 if not State.camLock then return end
 
-                angle += dt * 1.5
+                angle = angle + dt * 1.5
 
                 local x = math.cos(angle) * 10
                 local z = math.sin(angle) * 10
@@ -1479,20 +1376,12 @@ VisualTab:CreateToggle({
     end,
 })
 
-VisualTab:CreateToggle({
-    Name = "TPCamera Area Walk",
-    CurrentValue = false,
-    Flag = "TPCamera",
-    Callback = function(v)
-        State.tpCamera = v
-        if v then startTPCameraRoute() else stopTPCameraRoute() end
-    end,
-})
+VisualTab:CreateToggle({ Name = I.map .. " TPCamera Area Walk", CurrentValue = false, Flag = "TPCamera", Callback = function(v) State.tpCamera = v if v then startTPCameraRoute() else stopTPCameraRoute() end end })
 
-OtherTab:CreateSection("Other")
+OtherTab:CreateSection(I.gear .. " Other")
 
 OtherTab:CreateButton({
-    Name = "TurtleSpy",
+    Name = I.eye .. " TurtleSpy",
     Callback = function()
         pcall(function()
             loadstring(game:HttpGet("https://raw.githubusercontent.com/Turtle-Brand/Turtle-Spy/main/source.lua", true))()
@@ -1501,7 +1390,7 @@ OtherTab:CreateButton({
 })
 
 OtherTab:CreateButton({
-    Name = "Anti Afk",
+    Name = I.shield .. " Anti Afk",
     Callback = function()
         pcall(function()
             loadstring(game:HttpGet("https://raw.githubusercontent.com/hassanxzayn-lua/Anti-afk/main/antiafkbyhassanxzyn"))()
@@ -1510,10 +1399,10 @@ OtherTab:CreateButton({
 })
 
 OtherTab:CreateButton({
-    Name = "Copy Discord",
+    Name = I.check .. " Copy Discord",
     Callback = function()
         setclipboard("https://discord.gg/myjsXgDEC3")
-        notify("Discord", "Copiado.", 2)
+        notify(I.check .. " Discord", "Copiado.", 2)
     end,
 })
 
@@ -1563,8 +1452,8 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while task.wait(0.1) do
-        if os.clock() - merchantLastScan >= merchantScanDelay then
+    while task.wait(0.05) do
+        if merchantAutoBuyEnabled and os.clock() - merchantLastScan >= merchantScanDelay then
             merchantLastScan = os.clock()
             buyMerchantSelectedOnce()
         end
@@ -1623,9 +1512,7 @@ task.spawn(function()
             end)
         end
 
-        if State.autoPerk then
-            pcall(forceActivateEquippedPerks)
-        end
+        if State.autoPerk then pcall(forceActivateEquippedPerks) end
 
         if State.autoClaim then
             for i = 1, 12 do
@@ -1643,18 +1530,7 @@ task.spawn(function()
 
         if State.autoDaily then pcall(function() RE.ClaimLoginReward:FireServer() end) end
         if State.autoAch then pcall(function() RE.ClaimAllAchievements:FireServer() end) end
-
-        if State.autoEasterCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "Easter2024Crate", MerchantId = "MoleMerchant" }) end) end
-        if State.autoHatDropBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "HatDropBoost", MerchantId = "MoleMerchant" }) end) end
-        if State.autoComumEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "ComumEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoRareEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "RareEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoEpicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EpicEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoLegendaryEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "LegendaryEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoGodlyEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "GodlyEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoMythicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MythicEventPotion", MerchantId = "MoleMerchant" }) end) end
-        if State.autoMoleBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MoleBoost", MerchantId = "MoleMerchant" }) end) end
-        if State.autoEventBooster then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EventBooster", MerchantId = "MoleMerchant" }) end) end
     end
 end)
 
-notify("Unboxing Hub", "GUI carregado com Merchant inteligente, Area Farm corrigido e Perk Favorite melhorado.", 4)
+notify(I.gift .. " Unboxing Hub", "GUI carregado com emojis, Merchant corrigido e Auto Attack antigo.", 4)
