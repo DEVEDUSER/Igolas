@@ -1,7 +1,18 @@
---// Carregar Rayfield
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local Rayfield
+do
+    local ok, result = pcall(function()
+        local source = game:HttpGet("https://sirius.menu/rayfield", true)
+        local fn = loadstring(source)
+        return fn()
+    end)
+    if ok and result then
+        Rayfield = result
+    else
+        warn("Falha ao carregar Rayfield:", result)
+        return
+    end
+end
 
---// SERVICES
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -12,28 +23,32 @@ local player = Players.LocalPlayer
 local RE = ReplicatedStorage:WaitForChild("RE")
 local RF = ReplicatedStorage:WaitForChild("RF")
 
---// MODULES
 local PlayerData = require(ReplicatedStorage.Modules.PlayerData)
 local ItemData = require(ReplicatedStorage.Shared.ItemData)
 local Clock = require(ReplicatedStorage.Shared.Clock)
 local BoxController = require(ReplicatedStorage.Controllers.BoxController)
 local StateUtil = require(ReplicatedStorage.Shared.StateUtil)
 
---// STATE
 local State = {
     autoGoldRush = false,
     autoEasterRush = false,
-    autoClaim = false,
     autoClose = false,
     autoCloseRushResults = false,
+    autoClaim = false,
     autoBP = false,
     autoDaily = false,
     autoAch = false,
     autoPerk = false,
-
     camLock = false,
     tpCamera = false,
-
+    autoSellHats = false,
+    autoSellPets = false,
+    autoSellPerks = false,
+    autoAttackBoxes = false,
+    autoAttackCameraLock = false,
+    autoWheel = false,
+    autoQuestClaim = false,
+    webhookEnabled = false,
     autoEasterCrate = false,
     autoHatDropBoost = false,
     autoComumEventPotion = false,
@@ -43,64 +58,16 @@ local State = {
     autoGodlyEventPotion = false,
     autoMythicEventPotion = false,
     autoMoleBoost = false,
-    autoEventBooster = false,
-    autoMerchantGoodDeal = false,
-
-    autoSellHats = false,
-    autoSellPets = false,
-    autoSellPerks = false,
-
-    autoAttackBoxes = false,
-    autoAttackCameraLock = false,
-
-    autoWheel = false,
-    autoQuestClaim = false,
-    webhookEnabled = false,
+    autoEventBooster = false
 }
 
---// VARS
-local camConn
-local camAttackConn
-local tpCameraRouteConn
-local farmAreaRouteConn
-
-local lockedCameraCenter
 local crateAmount = 1
 local autoRushWorld = 108
-
 local autoAttackRange = 65
 local autoAttackDelay = 0.05
 local autoSellDelay = 5
-
 local cameraScanRadius = 260
 local cameraSpinSpeed = 1.2
-
-local routePoints = {}
-local currentRouteIndex = 1
-local routeRadius = 80
-local routeStep = 25
-local routeReachDistance = 8
-local routeOffDistance = 35
-local routeStuckSince
-
-local autoFarmArea = false
-local farmAreaIndex = 1
-local farmAreaPoints = {}
-local farmAreaPointIndex = 1
-local farmAreaRadius = 90
-local farmAreaStep = 28
-local farmAreaReachDistance = 8
-local farmAreaTeleportBackDistance = 45
-local farmAreaCenter
-local farmAreaStuckSince
-
-local wheelDelay = 0.03
-local wheelBurst = 1
-local selectedWheelId = "Auto Detect"
-local lastWheelTick = 0
-
-local questClaimDelay = 0.5
-local lastQuestClaimTick = 0
 
 local webhookUrl = ""
 local webhookDelayMinutes = 60
@@ -110,89 +77,82 @@ local autoFavoriteRareDrops = true
 local autoFavoriteGoodPerks = true
 local perkFavoriteMinStat = 4.0
 
+local wheelDelay = 0.03
+local wheelBurst = 1
+local selectedWheelId = "Auto Detect"
+local lastWheelTick = 0
+
+local questClaimDelay = 0.5
+local lastQuestClaimTick = 0
+
+local camConn
+local camAttackConn
+local tpConn
+local areaConn
+local lockedCameraCenter
+
+local routePoints = {}
+local routeIndex = 1
+local routeRadius = 80
+local routeStep = 25
+
+local autoFarmArea = false
+local farmAreaIndex = 1
+local farmAreaRadius = 90
+local farmAreaStep = 28
+local farmAreaCenter
+local farmPoints = {}
+local farmPointIndex = 1
+
 local Stats = {
     startedAt = os.clock(),
     boxesBroken = 0,
-
     itemsSold = 0,
     hatsSold = 0,
     petsSold = 0,
     perksSold = 0,
-
     rushesDone = 0,
     rushesByName = {},
-
     cratesOpened = 0,
     cratesByName = {},
-
     eggRainGained = 0,
     bombRainGained = 0,
-    ticketsGained = 0,
+    ticketsGained = 0
 }
 
 local sellRarities = {
-    Hats = {
-        Common = true,
-        Rare = true,
-        Epic = false,
-        Legendary = false,
-        Godly = false,
-        Mythic = false,
-        Etherium = false,
-        Celestial = false,
-    },
-    Pets = {
-        Common = true,
-        Rare = true,
-        Epic = false,
-        Legendary = false,
-        Godly = false,
-        Mythic = false,
-        Etherium = false,
-        Celestial = false,
-    },
-    Perks = {
-        Common = true,
-        Rare = true,
-        Epic = false,
-        Legendary = false,
-        Godly = false,
-        Mythic = false,
-        Etherium = false,
-        Celestial = false,
-    },
+    Hats = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
+    Pets = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
+    Perks = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false }
 }
 
 local rarityAliases = {
     Mythical = "Mythic",
     Ethereal = "Etherium",
-    Ethereum = "Etherium",
+    Ethereum = "Etherium"
 }
 
---// BLUR
 local blur = Instance.new("BlurEffect")
 blur.Size = 0
 blur.Parent = Lighting
 
---// WINDOW
 local Window = Rayfield:CreateWindow({
     Name = "Unboxing Hub V1",
-    LoadingTitle = "Unboxing Hub Interface",
+    LoadingTitle = "Unboxing Hub",
     LoadingSubtitle = "by DrSkrr",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = "UnboxingHub",
-        FileName = "Config",
+        FileName = "Config"
     },
     Discord = {
         Enabled = true,
         Invite = "myjsXgDEC3",
-        RememberJoins = true,
+        RememberJoins = true
     },
-    KeySystem = false,
+    KeySystem = false
 })
 
---// TABS
 local FarmTab = Window:CreateTab("Farm", 4483362458)
 local EventTab = Window:CreateTab("Event", 4483362458)
 local RewardsTab = Window:CreateTab("Rewards", 4483362458)
@@ -207,24 +167,15 @@ local StatsTab = Window:CreateTab("Stats", 4483362458)
 local VisualTab = Window:CreateTab("Visual", 4483362458)
 local OtherTab = Window:CreateTab("Other", 4483362458)
 
---// HELPERS
-local function notify(title, content, duration)
+local function notify(t, c, d)
     pcall(function()
         Rayfield:Notify({
-            Title = tostring(title),
-            Content = tostring(content),
-            Duration = duration or 3,
-            Image = 4483362458,
+            Title = tostring(t),
+            Content = tostring(c),
+            Duration = d or 3,
+            Image = 4483362458
         })
     end)
-end
-
-local function countDict(tbl)
-    local count = 0
-    for _ in pairs(tbl or {}) do
-        count += 1
-    end
-    return count
 end
 
 local function formatTime(seconds)
@@ -235,83 +186,73 @@ local function formatTime(seconds)
     return string.format("%02d:%02d:%02d", h, m, s)
 end
 
-local function normalizeRarity(name)
-    return rarityAliases[name] or name
+local function countDict(tbl)
+    local n = 0
+    for _ in pairs(tbl or {}) do
+        n = n + 1
+    end
+    return n
 end
 
 local function getItemData(invItem)
     if not invItem or not invItem.ItemId then return nil end
-
     local ok, data = pcall(function()
         return ItemData.Get(invItem.ItemId)
     end)
-
-    return ok and data or nil
+    if ok then return data end
+    return nil
 end
 
 local function getRarityName(itemData)
     if not itemData or not itemData.Rarity then return nil end
-
-    local ok, rarityName = pcall(function()
+    local ok, name = pcall(function()
         return ItemData.GetRawRarityName(itemData.Rarity)
     end)
-
-    return ok and normalizeRarity(rarityName) or nil
+    if ok then return rarityAliases[name] or name end
+    return nil
 end
 
 local function getBestPerkStat(invItem)
     local best = 0
-
-    local function scan(value)
-        if type(value) == "number" then
-            if value > best then
-                best = value
-            end
-        elseif type(value) == "table" then
-            for _, v in pairs(value) do
-                scan(v)
-            end
+    local function scan(v)
+        if type(v) == "number" then
+            if v > best then best = v end
+        elseif type(v) == "table" then
+            for _, x in pairs(v) do scan(x) end
         end
     end
-
-    scan(invItem.Stats)
-    scan(invItem.Stat)
-    scan(invItem.Modifiers)
-    scan(invItem.Boosts)
-    scan(invItem.Multiplier)
-    scan(invItem.Power)
-    scan(invItem.Value)
-
+    if invItem then
+        scan(invItem.Stats)
+        scan(invItem.Stat)
+        scan(invItem.Modifiers)
+        scan(invItem.Boosts)
+        scan(invItem.Multiplier)
+        scan(invItem.Power)
+        scan(invItem.Value)
+    end
     return best
 end
 
 local function isRareDrop(invItem)
     if not invItem then return false end
-
-    local raw = tostring(invItem.ItemId or invItem.Id or invItem.Name or "")
-    local lowered = string.lower(raw)
-
-    return lowered:find("eggrain") ~= nil
-        or lowered:find("egg rain") ~= nil
-        or lowered:find("bombrain") ~= nil
-        or lowered:find("bomb rain") ~= nil
-        or lowered:find("bomb%-rain") ~= nil
+    local txt = string.lower(tostring(invItem.ItemId or invItem.Id or invItem.Name or ""))
+    return txt:find("eggrain") or txt:find("egg rain") or txt:find("bombrain") or txt:find("bomb rain") or txt:find("bomb%-rain")
 end
 
-local function favoriteOrLockItem(category, uniqueId)
+local function favoriteOrLockItem(category, uid)
     pcall(function()
         if RE:FindFirstChild("FavoriteItem") then
-            RE.FavoriteItem:FireServer(category, uniqueId, true)
+            RE.FavoriteItem:FireServer(category, uid, true)
         elseif RE:FindFirstChild("LockItem") then
-            RE.LockItem:FireServer(category, uniqueId, true)
+            RE.LockItem:FireServer(category, uid, true)
         elseif RE:FindFirstChild("ToggleFavorite") then
-            RE.ToggleFavorite:FireServer(category, uniqueId)
+            RE.ToggleFavorite:FireServer(category, uid)
         elseif RF:FindFirstChild("FavoriteItem") then
-            RF.FavoriteItem:InvokeServer(category, uniqueId, true)
+            RF.FavoriteItem:InvokeServer(category, uid, true)
         elseif RF:FindFirstChild("LockItem") then
-            RF.LockItem:InvokeServer(category, uniqueId, true)
+            RF.LockItem:InvokeServer(category, uid, true)
         elseif RF:FindFirstChild("ToggleFavorite") then
-            RF.ToggleFavorite:InvokeServer(category, uniqueId)
+            RF.ToggleFavorite:InvokeServer(category, uid)
         end
     end)
 end
@@ -319,11 +260,9 @@ end
 local function shouldSellItem(invItem, category)
     if not invItem then return false end
     if invItem.IsEquipped or invItem.IsFavorite or invItem.Locked then return false end
-
     local data = getItemData(invItem)
-    local rarityName = getRarityName(data)
-
-    return rarityName and sellRarities[category] and sellRarities[category][rarityName] == true
+    local rarity = getRarityName(data)
+    return rarity and sellRarities[category] and sellRarities[category][rarity] == true
 end
 
 local function protectSpecialItems()
@@ -332,23 +271,16 @@ local function protectSpecialItems()
 
     for _, category in ipairs({ "Hats", "Pets", "Perks" }) do
         local storage = data[category]
-
         if storage then
-            for uniqueId, invItem in pairs(storage) do
+            for uid, invItem in pairs(storage) do
                 if autoFavoriteRareDrops and isRareDrop(invItem) then
-                    favoriteOrLockItem(category, uniqueId)
+                    favoriteOrLockItem(category, uid)
                     invItem.IsFavorite = true
                     invItem.Locked = true
-                end
-
-                if category == "Perks" and autoFavoriteGoodPerks then
-                    local bestStat = getBestPerkStat(invItem)
-
-                    if bestStat >= perkFavoriteMinStat then
-                        favoriteOrLockItem(category, uniqueId)
-                        invItem.IsFavorite = true
-                        invItem.Locked = true
-                    end
+                elseif category == "Perks" and autoFavoriteGoodPerks and getBestPerkStat(invItem) >= perkFavoriteMinStat then
+                    favoriteOrLockItem(category, uid)
+                    invItem.IsFavorite = true
+                    invItem.Locked = true
                 end
             end
         end
@@ -364,27 +296,25 @@ local function sellInventoryCategory(category)
 
     local list = {}
 
-    for uniqueId, invItem in pairs(storage) do
+    for uid, invItem in pairs(storage) do
+        local protected = false
+
         if autoFavoriteRareDrops and isRareDrop(invItem) then
-            favoriteOrLockItem(category, uniqueId)
+            favoriteOrLockItem(category, uid)
             invItem.IsFavorite = true
             invItem.Locked = true
-            continue
+            protected = true
         end
 
-        if category == "Perks" and autoFavoriteGoodPerks then
-            local bestStat = getBestPerkStat(invItem)
-
-            if bestStat >= perkFavoriteMinStat then
-                favoriteOrLockItem(category, uniqueId)
-                invItem.IsFavorite = true
-                invItem.Locked = true
-                continue
-            end
+        if category == "Perks" and autoFavoriteGoodPerks and getBestPerkStat(invItem) >= perkFavoriteMinStat then
+            favoriteOrLockItem(category, uid)
+            invItem.IsFavorite = true
+            invItem.Locked = true
+            protected = true
         end
 
-        if shouldSellItem(invItem, category) then
-            table.insert(list, uniqueId)
+        if not protected and shouldSellItem(invItem, category) then
+            table.insert(list, uid)
         end
     end
 
@@ -392,24 +322,18 @@ local function sellInventoryCategory(category)
         table.remove(list)
     end
 
-    if #list <= 0 then return end
+    if #list == 0 then return end
 
     local ok, result = pcall(function()
         return RF.SellItems:InvokeServer(list, category)
     end)
 
     if ok and result then
-        Stats.itemsSold += #list
-
-        if category == "Hats" then
-            Stats.hatsSold += #list
-        elseif category == "Pets" then
-            Stats.petsSold += #list
-        elseif category == "Perks" then
-            Stats.perksSold += #list
-        end
-
-        notify("Auto Sell", "Vendeu " .. tostring(#list) .. " " .. tostring(category), 2)
+        Stats.itemsSold = Stats.itemsSold + #list
+        if category == "Hats" then Stats.hatsSold = Stats.hatsSold + #list end
+        if category == "Pets" then Stats.petsSold = Stats.petsSold + #list end
+        if category == "Perks" then Stats.perksSold = Stats.perksSold + #list end
+        notify("Auto Sell", "Vendeu " .. tostring(#list) .. " " .. category, 2)
     end
 end
 
@@ -429,7 +353,6 @@ local function getNearestBox()
         if box and box.CFrame and box.Health and box.Damage then
             if box.Health > box.Damage and not box.IsOpen then
                 local dist = (box.CFrame.Position - root.Position).Magnitude
-
                 if dist < nearestDist then
                     nearest = box
                     nearestDist = dist
@@ -458,10 +381,8 @@ local function getCameraBoxTarget()
         if box and box.CFrame and box.Health and box.Damage then
             if box.Health > box.Damage and not box.IsOpen then
                 local screenPos, onScreen = camera:WorldToViewportPoint(box.CFrame.Position)
-
                 if onScreen and screenPos.Z > 0 then
                     local score = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-
                     if score < bestScore then
                         bestScore = score
                         bestBox = box
@@ -487,17 +408,15 @@ local function buildRoutePoints(center, radius, step)
         end
 
         if math.floor((x + radius) / step) % 2 == 1 then
-            local reversed = {}
-
+            local rev = {}
             for i = #row, 1, -1 do
-                table.insert(reversed, row[i])
+                table.insert(rev, row[i])
             end
-
-            row = reversed
+            row = rev
         end
 
-        for _, point in ipairs(row) do
-            table.insert(points, point)
+        for _, p in ipairs(row) do
+            table.insert(points, p)
         end
     end
 
@@ -505,70 +424,39 @@ local function buildRoutePoints(center, radius, step)
 end
 
 local function startTPCameraRoute()
-    if tpCameraRouteConn then
-        tpCameraRouteConn:Disconnect()
-        tpCameraRouteConn = nil
-    end
+    if tpConn then tpConn:Disconnect() tpConn = nil end
 
     local char = player.Character or player.CharacterAdded:Wait()
     local root = char:WaitForChild("HumanoidRootPart")
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-
     lockedCameraCenter = lockedCameraCenter or root.Position
-    routePoints = buildRoutePoints(lockedCameraCenter, routeRadius, routeStep)
-    currentRouteIndex = 1
-    routeStuckSince = nil
 
-    tpCameraRouteConn = RunService.Heartbeat:Connect(function()
+    routePoints = buildRoutePoints(lockedCameraCenter, routeRadius, routeStep)
+    routeIndex = 1
+
+    tpConn = RunService.Heartbeat:Connect(function()
         if not State.tpCamera then return end
 
-        local charNow = player.Character
-        local rootNow = charNow and charNow:FindFirstChild("HumanoidRootPart")
-        local humanoidNow = charNow and charNow:FindFirstChildOfClass("Humanoid")
-        if not rootNow or not humanoidNow or #routePoints == 0 then return end
+        local c = player.Character
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if not r or not h or #routePoints == 0 then return end
 
-        local target = routePoints[currentRouteIndex]
-        local flatRoot = Vector3.new(rootNow.Position.X, lockedCameraCenter.Y, rootNow.Position.Z)
-        local flatTarget = Vector3.new(target.X, lockedCameraCenter.Y, target.Z)
-        local distToTarget = (flatRoot - flatTarget).Magnitude
+        local target = routePoints[routeIndex]
+        local flatR = Vector3.new(r.Position.X, lockedCameraCenter.Y, r.Position.Z)
+        local flatT = Vector3.new(target.X, lockedCameraCenter.Y, target.Z)
 
-        if distToTarget <= routeReachDistance then
-            currentRouteIndex += 1
-
-            if currentRouteIndex > #routePoints then
-                currentRouteIndex = 1
-            end
-
-            target = routePoints[currentRouteIndex]
+        if (flatR - flatT).Magnitude <= 8 then
+            routeIndex = routeIndex + 1
+            if routeIndex > #routePoints then routeIndex = 1 end
+            target = routePoints[routeIndex]
         end
 
-        humanoidNow:MoveTo(target)
-
-        local distFromCenter = (flatRoot - lockedCameraCenter).Magnitude
-        local outsideArea = distFromCenter > routeRadius + 12
-        local tooFarFromTarget = distToTarget > routeOffDistance
-
-        if outsideArea or tooFarFromTarget then
-            routeStuckSince = routeStuckSince or os.clock()
-
-            if os.clock() - routeStuckSince >= 5 then
-                rootNow.CFrame = CFrame.new(target + Vector3.new(0, 3, 0))
-                routeStuckSince = nil
-            end
-        else
-            routeStuckSince = nil
-        end
+        h:MoveTo(target)
     end)
 end
 
 local function stopTPCameraRoute()
-    if tpCameraRouteConn then
-        tpCameraRouteConn:Disconnect()
-        tpCameraRouteConn = nil
-    end
-
-    routeStuckSince = nil
+    if tpConn then tpConn:Disconnect() tpConn = nil end
 end
 
 local function getAreaModel(index)
@@ -576,7 +464,6 @@ local function getAreaModel(index)
     if not areas then return nil end
 
     local prefix = tostring(index) .. "_"
-
     for _, area in ipairs(areas:GetChildren()) do
         if tostring(area.Name):sub(1, #prefix) == prefix then
             return area
@@ -593,19 +480,14 @@ local function getModelCenter(model)
         return model:GetPivot()
     end)
 
-    if ok and cf then
-        return cf.Position
-    end
+    if ok and cf then return cf.Position end
 
     local part = model:FindFirstChildWhichIsA("BasePart", true)
     return part and part.Position or nil
 end
 
 local function startFarmAreaRoute()
-    if farmAreaRouteConn then
-        farmAreaRouteConn:Disconnect()
-        farmAreaRouteConn = nil
-    end
+    if areaConn then areaConn:Disconnect() areaConn = nil end
 
     local area = getAreaModel(farmAreaIndex)
     farmAreaCenter = getModelCenter(area)
@@ -617,87 +499,61 @@ local function startFarmAreaRoute()
 
     local char = player.Character or player.CharacterAdded:Wait()
     local root = char:WaitForChild("HumanoidRootPart")
-
     root.CFrame = CFrame.new(farmAreaCenter + Vector3.new(0, 4, 0))
 
-    farmAreaPoints = buildRoutePoints(farmAreaCenter, farmAreaRadius, farmAreaStep)
-    farmAreaPointIndex = 1
-    farmAreaStuckSince = nil
+    farmPoints = buildRoutePoints(farmAreaCenter, farmAreaRadius, farmAreaStep)
+    farmPointIndex = 1
     State.autoAttackBoxes = true
 
-    farmAreaRouteConn = RunService.Heartbeat:Connect(function()
+    areaConn = RunService.Heartbeat:Connect(function()
         if not autoFarmArea then return end
 
-        local charNow = player.Character
-        local rootNow = charNow and charNow:FindFirstChild("HumanoidRootPart")
-        local humanoidNow = charNow and charNow:FindFirstChildOfClass("Humanoid")
-        if not rootNow or not humanoidNow or #farmAreaPoints == 0 then return end
+        local c = player.Character
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if not r or not h or #farmPoints == 0 then return end
 
-        local target = farmAreaPoints[farmAreaPointIndex]
-        local flatRoot = Vector3.new(rootNow.Position.X, farmAreaCenter.Y, rootNow.Position.Z)
-        local flatTarget = Vector3.new(target.X, farmAreaCenter.Y, target.Z)
-        local dist = (flatRoot - flatTarget).Magnitude
+        local target = farmPoints[farmPointIndex]
+        local flatR = Vector3.new(r.Position.X, farmAreaCenter.Y, r.Position.Z)
+        local flatT = Vector3.new(target.X, farmAreaCenter.Y, target.Z)
 
-        if dist <= farmAreaReachDistance then
-            farmAreaPointIndex += 1
-
-            if farmAreaPointIndex > #farmAreaPoints then
-                farmAreaPointIndex = 1
-            end
-
-            target = farmAreaPoints[farmAreaPointIndex]
+        if (flatR - flatT).Magnitude <= 8 then
+            farmPointIndex = farmPointIndex + 1
+            if farmPointIndex > #farmPoints then farmPointIndex = 1 end
+            target = farmPoints[farmPointIndex]
         end
 
-        humanoidNow:MoveTo(target)
-
-        local distFromCenter = (flatRoot - farmAreaCenter).Magnitude
-
-        if distFromCenter > farmAreaRadius + farmAreaTeleportBackDistance then
-            farmAreaStuckSince = farmAreaStuckSince or os.clock()
-
-            if os.clock() - farmAreaStuckSince >= 5 then
-                rootNow.CFrame = CFrame.new(target + Vector3.new(0, 4, 0))
-                farmAreaStuckSince = nil
-            end
-        else
-            farmAreaStuckSince = nil
-        end
+        h:MoveTo(target)
     end)
 
     notify("Area Farm", "Farmando area " .. tostring(farmAreaIndex), 3)
 end
 
 local function stopFarmAreaRoute()
-    if farmAreaRouteConn then
-        farmAreaRouteConn:Disconnect()
-        farmAreaRouteConn = nil
-    end
-
-    farmAreaStuckSince = nil
+    if areaConn then areaConn:Disconnect() areaConn = nil end
 end
 
 local function getEquippedPerkIds()
     local data = PlayerData.data
     local ids = {}
-
     if not data then return ids end
 
     if type(data.PerksEquipped) == "table" then
-        for _, perkId in pairs(data.PerksEquipped) do
-            if perkId then table.insert(ids, perkId) end
+        for _, id in pairs(data.PerksEquipped) do
+            if id then table.insert(ids, id) end
         end
     end
 
     if type(data.EquippedPerks) == "table" then
-        for _, perkId in pairs(data.EquippedPerks) do
-            if perkId then table.insert(ids, perkId) end
+        for _, id in pairs(data.EquippedPerks) do
+            if id then table.insert(ids, id) end
         end
     end
 
     if type(data.Perks) == "table" then
-        for uniqueId, perk in pairs(data.Perks) do
+        for uid, perk in pairs(data.Perks) do
             if perk and (perk.IsEquipped or perk.Equipped or perk.Slot or perk.TeamIndex) then
-                table.insert(ids, uniqueId)
+                table.insert(ids, uid)
             end
         end
     end
@@ -706,43 +562,31 @@ local function getEquippedPerkIds()
 end
 
 local function forceActivateEquippedPerks()
-    for _, perkId in ipairs(getEquippedPerkIds()) do
+    for _, id in ipairs(getEquippedPerkIds()) do
         pcall(function()
-            RE.ActivatePerk:FireServer(perkId)
+            RE.ActivatePerk:FireServer(id)
         end)
-
         task.wait(0.15)
     end
 end
 
 local function recordRush(name)
-    Stats.rushesDone += 1
+    Stats.rushesDone = Stats.rushesDone + 1
     Stats.rushesByName[name] = (Stats.rushesByName[name] or 0) + 1
 end
 
 local function trackCrateReward(value)
     if type(value) == "string" then
-        local lowered = string.lower(value)
-
-        if lowered:find("eggrain") or lowered:find("egg rain") then
-            Stats.eggRainGained += 1
-        end
-
-        if lowered:find("bombrain") or lowered:find("bomb rain") or lowered:find("bomb%-rain") then
-            Stats.bombRainGained += 1
-        end
-
-        if lowered:find("ticket") then
-            Stats.ticketsGained += 1
-        end
+        local s = string.lower(value)
+        if s:find("eggrain") or s:find("egg rain") then Stats.eggRainGained = Stats.eggRainGained + 1 end
+        if s:find("bombrain") or s:find("bomb rain") or s:find("bomb%-rain") then Stats.bombRainGained = Stats.bombRainGained + 1 end
+        if s:find("ticket") then Stats.ticketsGained = Stats.ticketsGained + 1 end
     elseif type(value) == "table" then
         for k, v in pairs(value) do
-            local key = tostring(k):lower()
-
+            local key = string.lower(tostring(k))
             if key:find("ticket") and type(v) == "number" then
-                Stats.ticketsGained += v
+                Stats.ticketsGained = Stats.ticketsGained + v
             end
-
             trackCrateReward(k)
             trackCrateReward(v)
         end
@@ -757,12 +601,10 @@ local function openCrateAndTrack(crateId, amount)
     end)
 
     if ok then
-        Stats.cratesOpened += amount
+        Stats.cratesOpened = Stats.cratesOpened + amount
         Stats.cratesByName[crateId] = (Stats.cratesByName[crateId] or 0) + amount
         trackCrateReward(result)
     end
-
-    return ok, result
 end
 
 local function getNearestWheelId()
@@ -778,16 +620,11 @@ local function getNearestWheelId()
 
         if ok and wheelId then
             local pos
-
-            if inst:IsA("BasePart") then
-                pos = inst.Position
-            elseif inst:IsA("Model") then
-                pos = inst:GetPivot().Position
-            end
+            if inst:IsA("BasePart") then pos = inst.Position end
+            if inst:IsA("Model") then pos = inst:GetPivot().Position end
 
             if pos then
                 local dist = root and (pos - root.Position).Magnitude or 0
-
                 if dist < nearestDist then
                     nearestDist = dist
                     nearestId = wheelId
@@ -801,11 +638,7 @@ end
 
 local function spinSelectedWheel()
     local wheelId = selectedWheelId
-
-    if wheelId == "Auto Detect" then
-        wheelId = getNearestWheelId()
-    end
-
+    if wheelId == "Auto Detect" then wheelId = getNearestWheelId() end
     if not wheelId then return end
 
     pcall(function()
@@ -814,48 +647,15 @@ local function spinSelectedWheel()
 end
 
 local function claimAllQuestLike()
-    pcall(function()
-        if RE:FindFirstChild("ClaimDungeonQuest") then
-            RE.ClaimDungeonQuest:FireServer()
-        end
-    end)
-
-    pcall(function()
-        if RE:FindFirstChild("ClaimAllAchievements") then
-            RE.ClaimAllAchievements:FireServer()
-        end
-    end)
-
-    pcall(function()
-        if RE:FindFirstChild("ClaimLoginReward") then
-            RE.ClaimLoginReward:FireServer()
-        end
-    end)
+    pcall(function() if RE:FindFirstChild("ClaimDungeonQuest") then RE.ClaimDungeonQuest:FireServer() end end)
+    pcall(function() if RE:FindFirstChild("ClaimAllAchievements") then RE.ClaimAllAchievements:FireServer() end end)
+    pcall(function() if RE:FindFirstChild("ClaimLoginReward") then RE.ClaimLoginReward:FireServer() end end)
 
     for i = 1, 30 do
-        pcall(function()
-            if RE:FindFirstChild("ClaimPlaytimeReward") then
-                RE.ClaimPlaytimeReward:FireServer(i)
-            end
-        end)
-
-        pcall(function()
-            if RE:FindFirstChild("ClaimBattlePassTask") then
-                RE.ClaimBattlePassTask:FireServer(i)
-            end
-        end)
-
-        pcall(function()
-            if RE:FindFirstChild("ClaimQuest") then
-                RE.ClaimQuest:FireServer(i)
-            end
-        end)
-
-        pcall(function()
-            if RE:FindFirstChild("ClaimTask") then
-                RE.ClaimTask:FireServer(i)
-            end
-        end)
+        pcall(function() if RE:FindFirstChild("ClaimPlaytimeReward") then RE.ClaimPlaytimeReward:FireServer(i) end end)
+        pcall(function() if RE:FindFirstChild("ClaimBattlePassTask") then RE.ClaimBattlePassTask:FireServer(i) end end)
+        pcall(function() if RE:FindFirstChild("ClaimQuest") then RE.ClaimQuest:FireServer(i) end end)
+        pcall(function() if RE:FindFirstChild("ClaimTask") then RE.ClaimTask:FireServer(i) end end)
     end
 end
 
@@ -866,10 +666,8 @@ local function sendWebhook(message)
     end
 
     local req = http_request or request or syn and syn.request or fluxus and fluxus.request
-
     if not req then
-        warn("Webhook nao suportado nesse executor.")
-        notify("Webhook", "Seu executor nao suporta request/http_request.", 4)
+        notify("Webhook", "Executor sem request/http_request.", 4)
         return
     end
 
@@ -877,12 +675,8 @@ local function sendWebhook(message)
         req({
             Url = webhookUrl,
             Method = "POST",
-            Headers = {
-                ["Content-Type"] = "application/json",
-            },
-            Body = HttpService:JSONEncode({
-                content = tostring(message),
-            }),
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ content = tostring(message) })
         })
     end)
 end
@@ -890,111 +684,62 @@ end
 local function buildWebhookReport()
     local lines = {}
 
-    table.insert(lines, "**Unboxing Hub - Relatorio**")
-    table.insert(lines, "Player: `" .. tostring(player.Name) .. "`")
-    table.insert(lines, "Tempo da sessao: `" .. formatTime(os.clock() - Stats.startedAt) .. "`")
-    table.insert(lines, "Easter Rush: `" .. tostring(Stats.rushesByName["Easter Rush"] or 0) .. "`")
-    table.insert(lines, "Gold Rush: `" .. tostring(Stats.rushesByName["Gold Rush"] or 0) .. "`")
-    table.insert(lines, "Caixas quebradas: `" .. tostring(Stats.boxesBroken) .. "`")
-    table.insert(lines, "Crates abertas: `" .. tostring(Stats.cratesOpened) .. "`")
-    table.insert(lines, "EggRain ganhos: `" .. tostring(Stats.eggRainGained) .. "`")
-    table.insert(lines, "BombRain ganhos: `" .. tostring(Stats.bombRainGained) .. "`")
-    table.insert(lines, "Tickets ganhos: `" .. tostring(Stats.ticketsGained) .. "`")
-    table.insert(lines, "Itens vendidos: `" .. tostring(Stats.itemsSold) .. "`")
-    table.insert(lines, "Hats vendidos: `" .. tostring(Stats.hatsSold) .. "`")
-    table.insert(lines, "Pets vendidos: `" .. tostring(Stats.petsSold) .. "`")
-    table.insert(lines, "Perks vendidos: `" .. tostring(Stats.perksSold) .. "`")
-    table.insert(lines, "")
-    table.insert(lines, "**Crates:**")
+    table.insert(lines, "Unboxing Hub - Relatorio")
+    table.insert(lines, "Player: " .. tostring(player.Name))
+    table.insert(lines, "Tempo: " .. formatTime(os.clock() - Stats.startedAt))
+    table.insert(lines, "Easter Rush: " .. tostring(Stats.rushesByName["Easter Rush"] or 0))
+    table.insert(lines, "Gold Rush: " .. tostring(Stats.rushesByName["Gold Rush"] or 0))
+    table.insert(lines, "Caixas quebradas: " .. tostring(Stats.boxesBroken))
+    table.insert(lines, "Crates abertas: " .. tostring(Stats.cratesOpened))
+    table.insert(lines, "EggRain: " .. tostring(Stats.eggRainGained))
+    table.insert(lines, "BombRain: " .. tostring(Stats.bombRainGained))
+    table.insert(lines, "Tickets: " .. tostring(Stats.ticketsGained))
+    table.insert(lines, "Vendidos: " .. tostring(Stats.itemsSold))
+    table.insert(lines, "Hats vendidos: " .. tostring(Stats.hatsSold))
+    table.insert(lines, "Pets vendidos: " .. tostring(Stats.petsSold))
+    table.insert(lines, "Perks vendidos: " .. tostring(Stats.perksSold))
+    table.insert(lines, "Crates:")
 
     local hasCrate = false
-
     for crateName, count in pairs(Stats.cratesByName) do
         hasCrate = true
-        table.insert(lines, "- " .. tostring(crateName) .. ": `" .. tostring(count) .. "`")
+        table.insert(lines, "- " .. tostring(crateName) .. ": " .. tostring(count))
     end
 
     if not hasCrate then
-        table.insert(lines, "- Nenhuma crate registrada")
+        table.insert(lines, "- nenhuma")
     end
 
-    return table.concat(lines, "
-")
+    return table.concat(lines, "\n")
 end
 
 pcall(function()
     RE.BoxesDestroyed.OnClientEvent:Connect(function(_, boxBuffer)
         local count = 0
-
         pcall(function()
             count = buffer.len(boxBuffer) // 2
         end)
-
-        Stats.boxesBroken += count
+        Stats.boxesBroken = Stats.boxesBroken + count
     end)
 end)
 
---// FARM TAB
-FarmTab:CreateSection("Farm Features")
+FarmTab:CreateSection("Farm")
 
 FarmTab:CreateInput({
     Name = "Mundo do Auto Gold Rush",
     PlaceholderText = "Ex: 108",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num then
-            autoRushWorld = num
-            notify("Auto Rush", "Mundo definido: " .. tostring(num), 2)
-        end
-    end,
+        local n = tonumber(Text)
+        if n then autoRushWorld = n end
+    end
 })
 
-FarmTab:CreateToggle({
-    Name = "Auto Gold Rush",
-    CurrentValue = false,
-    Flag = "AutoGoldRush",
-    Callback = function(Value)
-        State.autoGoldRush = Value
-    end,
-})
-
-FarmTab:CreateToggle({
-    Name = "Auto Easter Rush",
-    CurrentValue = false,
-    Flag = "AutoEasterRush",
-    Callback = function(Value)
-        State.autoEasterRush = Value
-    end,
-})
-
-FarmTab:CreateToggle({
-    Name = "Auto Close",
-    CurrentValue = false,
-    Flag = "AutoClose",
-    Callback = function(Value)
-        State.autoClose = Value
-    end,
-})
-
-FarmTab:CreateToggle({
-    Name = "Auto Close Rush Results",
-    CurrentValue = false,
-    Flag = "AutoCloseRushResults",
-    Callback = function(Value)
-        State.autoCloseRushResults = Value
-    end,
-})
-
-FarmTab:CreateToggle({
-    Name = "NeverGlitch",
-    CurrentValue = false,
-    Flag = "NeverGlitch",
-    Callback = function(Value)
-        State.autoPerk = Value
-    end,
-})
+FarmTab:CreateToggle({ Name = "Auto Gold Rush", CurrentValue = false, Flag = "AutoGoldRush", Callback = function(v) State.autoGoldRush = v end })
+FarmTab:CreateToggle({ Name = "Auto Easter Rush", CurrentValue = false, Flag = "AutoEasterRush", Callback = function(v) State.autoEasterRush = v end })
+FarmTab:CreateToggle({ Name = "Auto Close", CurrentValue = false, Flag = "AutoClose", Callback = function(v) State.autoClose = v end })
+FarmTab:CreateToggle({ Name = "Auto Close Rush Results", CurrentValue = false, Flag = "AutoCloseRushResults", Callback = function(v) State.autoCloseRushResults = v end })
+FarmTab:CreateToggle({ Name = "NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
 
 FarmTab:CreateButton({
     Name = "BOMB RAIN",
@@ -1002,383 +747,253 @@ FarmTab:CreateButton({
         pcall(function()
             RE.PromptProductPurchase:FireServer("BombRainInstant")
         end)
-    end,
+    end
 })
 
---// EVENT TAB
 EventTab:CreateSection("Mole Merchant")
+EventTab:CreateToggle({ Name = "EasterCrate", CurrentValue = false, Flag = "EasterCrate", Callback = function(v) State.autoEasterCrate = v end })
+EventTab:CreateToggle({ Name = "HatDropBoost", CurrentValue = false, Flag = "HatDropBoost", Callback = function(v) State.autoHatDropBoost = v end })
+EventTab:CreateToggle({ Name = "ComumEventPotion", CurrentValue = false, Flag = "ComumEventPotion", Callback = function(v) State.autoComumEventPotion = v end })
+EventTab:CreateToggle({ Name = "RareEventPotion", CurrentValue = false, Flag = "RareEventPotion", Callback = function(v) State.autoRareEventPotion = v end })
+EventTab:CreateToggle({ Name = "EpicEventPotion", CurrentValue = false, Flag = "EpicEventPotion", Callback = function(v) State.autoEpicEventPotion = v end })
+EventTab:CreateToggle({ Name = "LegendaryEventPotion", CurrentValue = false, Flag = "LegendaryEventPotion", Callback = function(v) State.autoLegendaryEventPotion = v end })
+EventTab:CreateToggle({ Name = "GodlyEventPotion", CurrentValue = false, Flag = "GodlyEventPotion", Callback = function(v) State.autoGodlyEventPotion = v end })
+EventTab:CreateToggle({ Name = "MythicEventPotion", CurrentValue = false, Flag = "MythicEventPotion", Callback = function(v) State.autoMythicEventPotion = v end })
+EventTab:CreateToggle({ Name = "MoleBoost", CurrentValue = false, Flag = "MoleBoost", Callback = function(v) State.autoMoleBoost = v end })
+EventTab:CreateToggle({ Name = "EventBooster", CurrentValue = false, Flag = "EventBooster", Callback = function(v) State.autoEventBooster = v end })
 
-EventTab:CreateToggle({ Name = "Auto Buy Good Deal", CurrentValue = false, Flag = "AutoMerchantGoodDeal", Callback = function(Value) State.autoMerchantGoodDeal = Value end })
-EventTab:CreateToggle({ Name = "EasterCrate", CurrentValue = false, Flag = "EasterCrate", Callback = function(Value) State.autoEasterCrate = Value end })
-EventTab:CreateToggle({ Name = "HatDropBoost", CurrentValue = false, Flag = "HatDropBoost", Callback = function(Value) State.autoHatDropBoost = Value end })
-EventTab:CreateToggle({ Name = "ComumEventPotion", CurrentValue = false, Flag = "ComumEventPotion", Callback = function(Value) State.autoComumEventPotion = Value end })
-EventTab:CreateToggle({ Name = "RareEventPotion", CurrentValue = false, Flag = "RareEventPotion", Callback = function(Value) State.autoRareEventPotion = Value end })
-EventTab:CreateToggle({ Name = "EpicEventPotion", CurrentValue = false, Flag = "EpicEventPotion", Callback = function(Value) State.autoEpicEventPotion = Value end })
-EventTab:CreateToggle({ Name = "LegendaryEventPotion", CurrentValue = false, Flag = "LegendaryEventPotion", Callback = function(Value) State.autoLegendaryEventPotion = Value end })
-EventTab:CreateToggle({ Name = "GodlyEventPotion", CurrentValue = false, Flag = "GodlyEventPotion", Callback = function(Value) State.autoGodlyEventPotion = Value end })
-EventTab:CreateToggle({ Name = "MythicEventPotion", CurrentValue = false, Flag = "MythicEventPotion", Callback = function(Value) State.autoMythicEventPotion = Value end })
-EventTab:CreateToggle({ Name = "MoleBoost", CurrentValue = false, Flag = "MoleBoost", Callback = function(Value) State.autoMoleBoost = Value end })
-EventTab:CreateToggle({ Name = "EventBooster", CurrentValue = false, Flag = "EventBooster", Callback = function(Value) State.autoEventBooster = Value end })
+RewardsTab:CreateSection("Rewards")
+RewardsTab:CreateToggle({ Name = "Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(v) State.autoClaim = v end })
+RewardsTab:CreateToggle({ Name = "Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
+RewardsTab:CreateToggle({ Name = "Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
+RewardsTab:CreateToggle({ Name = "Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
 
---// REWARDS TAB
-RewardsTab:CreateSection("Reward Features")
-
-RewardsTab:CreateToggle({ Name = "Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(Value) State.autoClaim = Value end })
-RewardsTab:CreateToggle({ Name = "Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(Value) State.autoBP = Value end })
-RewardsTab:CreateToggle({ Name = "Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(Value) State.autoDaily = Value end })
-RewardsTab:CreateToggle({ Name = "Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(Value) State.autoAch = Value end })
-
---// CRATES TAB
-CratesTab:CreateSection("Quantidade Compartilhada")
+CratesTab:CreateSection("Crates")
 
 CratesTab:CreateInput({
-    Name = "Quantidade de Caixas",
-    PlaceholderText = "Digite a quantidade",
+    Name = "Quantidade",
+    PlaceholderText = "Ex: 10",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num > 0 then
-            crateAmount = num
-            notify("Quantidade definida", "Todos os botoes usarao " .. tostring(num) .. " caixas", 3)
-        else
-            crateAmount = 1
-            notify("Numero invalido", "Usando 1 caixa por padrao", 2.5)
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n > 0 then crateAmount = n else crateAmount = 1 end
+    end
 })
 
-CratesTab:CreateSection("Crates Disponiveis")
-
-local function createCrateButton(name, crateId)
+local function crateButton(name, crateId)
     CratesTab:CreateButton({
         Name = name,
         Callback = function()
-            notify("Abrindo crate", "Abrindo " .. tostring(crateAmount) .. "x " .. crateId, 2)
             openCrateAndTrack(crateId, crateAmount)
-        end,
+        end
     })
 end
 
-createCrateButton("EasterCrate", "Easter2024Crate")
-createCrateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
-createCrateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
-createCrateButton("BasicPerk", "BasicPerkCrate")
-createCrateButton("BoxPerk", "BoxPerkCrate")
-
---// AUTO SELL TAB
-local rarityOrder = {
-    "Common",
-    "Rare",
-    "Epic",
-    "Legendary",
-    "Godly",
-    "Mythic",
-    "Etherium",
-    "Celestial",
-}
-
-local function createRarityToggles(category, title)
-    AutoSellTab:CreateSection(title)
-
-    AutoSellTab:CreateToggle({
-        Name = "Ativar Auto Sell " .. category,
-        CurrentValue = State["autoSell" .. category],
-        Flag = "AutoSell" .. category,
-        Callback = function(Value)
-            State["autoSell" .. category] = Value
-        end,
-    })
-
-    for _, rarityName in ipairs(rarityOrder) do
-        AutoSellTab:CreateToggle({
-            Name = rarityName,
-            CurrentValue = sellRarities[category][rarityName] == true,
-            Flag = "Sell" .. category .. rarityName,
-            Callback = function(Value)
-                sellRarities[category][rarityName] = Value
-            end,
-        })
-    end
-end
+crateButton("EasterCrate", "Easter2024Crate")
+crateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
+crateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
+crateButton("BasicPerk", "BasicPerkCrate")
+crateButton("BoxPerk", "BoxPerkCrate")
 
 AutoSellTab:CreateSection("Protecao")
 
-AutoSellTab:CreateToggle({
-    Name = "Favoritar EggRain/BombRain",
-    CurrentValue = true,
-    Flag = "AutoFavoriteRareDrops",
-    Callback = function(Value)
-        autoFavoriteRareDrops = Value
-    end,
-})
-
-AutoSellTab:CreateToggle({
-    Name = "Favoritar Perks bons",
-    CurrentValue = true,
-    Flag = "AutoFavoriteGoodPerks",
-    Callback = function(Value)
-        autoFavoriteGoodPerks = Value
-    end,
-})
+AutoSellTab:CreateToggle({ Name = "Favoritar EggRain/BombRain", CurrentValue = true, Flag = "AutoFavoriteRareDrops", Callback = function(v) autoFavoriteRareDrops = v end })
+AutoSellTab:CreateToggle({ Name = "Favoritar Perks bons", CurrentValue = true, Flag = "AutoFavoriteGoodPerks", Callback = function(v) autoFavoriteGoodPerks = v end })
 
 AutoSellTab:CreateInput({
     Name = "Stat minimo do Perk",
     PlaceholderText = "Padrao: 4.0",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num then
-            perkFavoriteMinStat = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n then perkFavoriteMinStat = n end
+    end
 })
 
 AutoSellTab:CreateInput({
-    Name = "Delay do Auto Sell",
+    Name = "Delay Auto Sell",
     PlaceholderText = "Padrao: 5",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 1 then
-            autoSellDelay = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 1 then autoSellDelay = n end
+    end
 })
 
-createRarityToggles("Hats", "Sell Hats")
-createRarityToggles("Pets", "Sell Pets")
-createRarityToggles("Perks", "Sell Perks")
+local rarityOrder = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic", "Etherium", "Celestial" }
 
-AutoSellTab:CreateSection("Acoes")
+local function rarityToggles(category)
+    AutoSellTab:CreateSection("Sell " .. category)
+
+    AutoSellTab:CreateToggle({
+        Name = "Ativar Auto Sell " .. category,
+        CurrentValue = false,
+        Flag = "AutoSell" .. category,
+        Callback = function(v)
+            State["autoSell" .. category] = v
+        end
+    })
+
+    for _, rarity in ipairs(rarityOrder) do
+        AutoSellTab:CreateToggle({
+            Name = rarity,
+            CurrentValue = sellRarities[category][rarity],
+            Flag = "Sell" .. category .. rarity,
+            Callback = function(v)
+                sellRarities[category][rarity] = v
+            end
+        })
+    end
+end
+
+rarityToggles("Hats")
+rarityToggles("Pets")
+rarityToggles("Perks")
 
 AutoSellTab:CreateButton({
-    Name = "Proteger Itens Especiais Agora",
+    Name = "Proteger Agora",
     Callback = function()
         protectSpecialItems()
-        notify("Protecao", "Itens especiais verificados.", 3)
-    end,
+        notify("Protecao", "Verificado.", 2)
+    end
 })
 
 AutoSellTab:CreateButton({
     Name = "Vender Agora",
     Callback = function()
         protectSpecialItems()
-        pcall(function() sellInventoryCategory("Hats") end)
-        pcall(function() sellInventoryCategory("Pets") end)
-        pcall(function() sellInventoryCategory("Perks") end)
-    end,
+        sellInventoryCategory("Hats")
+        sellInventoryCategory("Pets")
+        sellInventoryCategory("Perks")
+    end
 })
 
---// AUTO ATTACK TAB
 AutoAttackTab:CreateSection("Auto Attack")
 
-AutoAttackTab:CreateToggle({
-    Name = "Auto Attack Aura",
-    CurrentValue = false,
-    Flag = "AutoAttackBoxes",
-    Callback = function(Value)
-        State.autoAttackBoxes = Value
-    end,
-})
+AutoAttackTab:CreateToggle({ Name = "Auto Attack Aura", CurrentValue = false, Flag = "AutoAttackBoxes", Callback = function(v) State.autoAttackBoxes = v end })
 
 AutoAttackTab:CreateInput({
-    Name = "Distancia do Auto Attack",
+    Name = "Distancia",
     PlaceholderText = "Padrao: 65",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num > 0 then
-            autoAttackRange = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n > 0 then autoAttackRange = n end
+    end
 })
 
 AutoAttackTab:CreateInput({
-    Name = "Delay do Auto Attack",
+    Name = "Delay",
     PlaceholderText = "Padrao: 0.05",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 0.01 then
-            autoAttackDelay = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 0.01 then autoAttackDelay = n end
+    end
 })
-
-AutoAttackTab:CreateSection("Camera Attack")
 
 AutoAttackTab:CreateToggle({
     Name = "Auto Attack Camera Lock",
     CurrentValue = false,
     Flag = "AutoAttackCameraLock",
-    Callback = function(Value)
-        State.autoAttackCameraLock = Value
+    Callback = function(v)
+        State.autoAttackCameraLock = v
         local camera = workspace.CurrentCamera
 
-        if Value then
+        if v then
             local char = player.Character or player.CharacterAdded:Wait()
             local root = char:WaitForChild("HumanoidRootPart")
-
             lockedCameraCenter = lockedCameraCenter or root.Position
             root.CFrame = CFrame.new(lockedCameraCenter + Vector3.new(0, 3, 0))
-
             camera.CameraType = Enum.CameraType.Scriptable
 
-            if camAttackConn then
-                camAttackConn:Disconnect()
-                camAttackConn = nil
-            end
-
+            if camAttackConn then camAttackConn:Disconnect() end
             local angle = 0
 
             camAttackConn = RunService.RenderStepped:Connect(function(dt)
                 if not State.autoAttackCameraLock then return end
-
-                angle += dt * cameraSpinSpeed
-
+                angle = angle + dt * cameraSpinSpeed
                 local x = math.cos(angle) * 10
                 local z = math.sin(angle) * 10
-
-                camera.CFrame = CFrame.new(
-                    lockedCameraCenter + Vector3.new(x, 4, z),
-                    lockedCameraCenter
-                )
+                camera.CFrame = CFrame.new(lockedCameraCenter + Vector3.new(x, 4, z), lockedCameraCenter)
             end)
 
             State.tpCamera = true
             startTPCameraRoute()
         else
-            if camAttackConn then
-                camAttackConn:Disconnect()
-                camAttackConn = nil
-            end
-
+            if camAttackConn then camAttackConn:Disconnect() camAttackConn = nil end
             camera.CameraType = Enum.CameraType.Custom
-
             State.tpCamera = false
             stopTPCameraRoute()
         end
-    end,
+    end
 })
 
-AutoAttackTab:CreateInput({
-    Name = "Raio da Mira da Camera",
-    PlaceholderText = "Padrao: 260",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num > 20 then
-            cameraScanRadius = num
-        end
-    end,
-})
-
-AutoAttackTab:CreateInput({
-    Name = "Velocidade Giro Camera",
-    PlaceholderText = "Padrao: 1.2",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num > 0 then
-            cameraSpinSpeed = num
-        end
-    end,
-})
-
---// AREA FARM TAB
-AreaFarmTab:CreateSection("Farm por Area")
+AreaFarmTab:CreateSection("Area Farm")
 
 AreaFarmTab:CreateInput({
     Name = "Numero da Area",
     PlaceholderText = "Ex: 1",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num then
-            farmAreaIndex = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n then farmAreaIndex = n end
+    end
 })
 
 AreaFarmTab:CreateInput({
-    Name = "Raio da Area",
+    Name = "Raio",
     PlaceholderText = "Padrao: 90",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 20 then
-            farmAreaRadius = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 20 then farmAreaRadius = n end
+    end
 })
 
 AreaFarmTab:CreateInput({
-    Name = "Espacamento da Rota",
+    Name = "Espacamento",
     PlaceholderText = "Padrao: 28",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 8 then
-            farmAreaStep = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 8 then farmAreaStep = n end
+    end
 })
 
 AreaFarmTab:CreateToggle({
     Name = "Auto Farm Area + Attack",
     CurrentValue = false,
     Flag = "AutoFarmArea",
-    Callback = function(Value)
-        autoFarmArea = Value
-
-        if Value then
-            startFarmAreaRoute()
-        else
-            stopFarmAreaRoute()
-        end
-    end,
+    Callback = function(v)
+        autoFarmArea = v
+        if v then startFarmAreaRoute() else stopFarmAreaRoute() end
+    end
 })
 
 AreaFarmTab:CreateButton({
     Name = "Ir para Area",
     Callback = function()
-        local area = getAreaModel(farmAreaIndex)
-        local center = getModelCenter(area)
-
+        local center = getModelCenter(getAreaModel(farmAreaIndex))
         if center then
             local char = player.Character or player.CharacterAdded:Wait()
             local root = char:WaitForChild("HumanoidRootPart")
             root.CFrame = CFrame.new(center + Vector3.new(0, 4, 0))
         end
-    end,
+    end
 })
 
---// WHEEL TAB
-WheelTab:CreateSection("Auto Wheel")
+WheelTab:CreateSection("Wheel")
 
 WheelTab:CreateDropdown({
     Name = "Wheel",
-    Options = {
-        "Auto Detect",
-        "Easter",
-        "Default",
-    },
+    Options = { "Auto Detect", "Easter", "Default" },
     CurrentOption = { "Auto Detect" },
     MultipleOptions = false,
     Flag = "SelectedWheel",
-    Callback = function(Option)
-        selectedWheelId = Option[1]
-    end,
+    Callback = function(opt)
+        selectedWheelId = opt[1]
+    end
 })
 
 WheelTab:CreateInput({
@@ -1386,10 +1001,8 @@ WheelTab:CreateInput({
     PlaceholderText = "Opcional",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        if Text and Text ~= "" then
-            selectedWheelId = Text
-        end
-    end,
+        if Text and Text ~= "" then selectedWheelId = Text end
+    end
 })
 
 WheelTab:CreateInput({
@@ -1397,253 +1010,140 @@ WheelTab:CreateInput({
     PlaceholderText = "Padrao: 0.03",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 0.01 then
-            wheelDelay = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 0.01 then wheelDelay = n end
+    end
 })
 
 WheelTab:CreateInput({
-    Name = "Burst por Tick",
+    Name = "Burst",
     PlaceholderText = "Padrao: 1",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 1 then
-            wheelBurst = math.floor(num)
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 1 then wheelBurst = math.floor(n) end
+    end
 })
 
-WheelTab:CreateToggle({
-    Name = "Auto Wheel",
-    CurrentValue = false,
-    Flag = "AutoWheel",
-    Callback = function(Value)
-        State.autoWheel = Value
-    end,
-})
+WheelTab:CreateToggle({ Name = "Auto Wheel", CurrentValue = false, Flag = "AutoWheel", Callback = function(v) State.autoWheel = v end })
+WheelTab:CreateButton({ Name = "Girar Agora", Callback = spinSelectedWheel })
 
-WheelTab:CreateButton({
-    Name = "Girar Agora",
-    Callback = function()
-        spinSelectedWheel()
-    end,
-})
-
---// QUEST TAB
-QuestTab:CreateSection("Quest Claim")
+QuestTab:CreateSection("Quest")
 
 QuestTab:CreateInput({
-    Name = "Delay Claim Quest",
+    Name = "Delay Claim",
     PlaceholderText = "Padrao: 0.5",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 0.1 then
-            questClaimDelay = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 0.1 then questClaimDelay = n end
+    end
 })
 
-QuestTab:CreateToggle({
-    Name = "Auto Claim Quest",
-    CurrentValue = false,
-    Flag = "AutoQuestClaim",
-    Callback = function(Value)
-        State.autoQuestClaim = Value
-    end,
-})
+QuestTab:CreateToggle({ Name = "Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
+QuestTab:CreateButton({ Name = "Claim Agora", Callback = claimAllQuestLike })
 
-QuestTab:CreateButton({
-    Name = "Claim Agora",
-    Callback = function()
-        claimAllQuestLike()
-    end,
-})
-
---// WEBHOOK TAB
 WebhookTab:CreateSection("Discord Webhook")
 
 WebhookTab:CreateInput({
     Name = "Webhook URL",
-    PlaceholderText = "Cole o webhook do Discord aqui",
+    PlaceholderText = "Cole o webhook aqui",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
         webhookUrl = tostring(Text or "")
-    end,
+    end
 })
 
 WebhookTab:CreateInput({
-    Name = "Tempo entre mensagens em minutos",
+    Name = "Tempo em minutos",
     PlaceholderText = "Padrao: 60",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 1 then
-            webhookDelayMinutes = num
-        end
-    end,
+        local n = tonumber(Text)
+        if n and n >= 1 then webhookDelayMinutes = n end
+    end
 })
 
 WebhookTab:CreateToggle({
     Name = "Ativar Webhook Automatico",
     CurrentValue = false,
     Flag = "WebhookEnabled",
-    Callback = function(Value)
-        State.webhookEnabled = Value
+    Callback = function(v)
+        State.webhookEnabled = v
         lastWebhookAt = os.clock()
-    end,
+    end
 })
 
 WebhookTab:CreateButton({
     Name = "Test Webhook",
     Callback = function()
-        sendWebhook("Teste do Unboxing Hub enviado por `" .. tostring(player.Name) .. "`")
-        notify("Webhook", "Teste enviado.", 3)
-    end,
+        sendWebhook("Teste do Unboxing Hub - Player: " .. tostring(player.Name))
+        notify("Webhook", "Teste enviado.", 2)
+    end
 })
 
 WebhookTab:CreateButton({
     Name = "Enviar Relatorio Agora",
     Callback = function()
         sendWebhook(buildWebhookReport())
-        notify("Webhook", "Relatorio enviado.", 3)
-    end,
+        notify("Webhook", "Relatorio enviado.", 2)
+    end
 })
 
---// STATS TAB
-StatsTab:CreateSection("Session Stats")
+StatsTab:CreateSection("Stats")
 
 StatsTab:CreateButton({
     Name = "Mostrar Stats",
     Callback = function()
-        local rushText = ""
-
-        for name, count in pairs(Stats.rushesByName) do
-            rushText ..= name .. " x" .. tostring(count) .. " | "
-        end
-
-        notify(
-            "Sessao",
-            "Tempo: " .. formatTime(os.clock() - Stats.startedAt)
-                .. " | Boxes: " .. tostring(Stats.boxesBroken)
-                .. " | Crates: " .. tostring(Stats.cratesOpened)
-                .. " | Vendidos: " .. tostring(Stats.itemsSold)
-                .. " | Rushs: " .. tostring(Stats.rushesDone),
-            7
-        )
-
-        if rushText ~= "" then
-            notify("Rushs feitas", rushText, 7)
-        end
-    end,
+        notify("Sessao", "Tempo: " .. formatTime(os.clock() - Stats.startedAt) .. " | Boxes: " .. tostring(Stats.boxesBroken) .. " | Crates: " .. tostring(Stats.cratesOpened) .. " | Vendidos: " .. tostring(Stats.itemsSold), 7)
+    end
 })
 
---// VISUAL TAB
-VisualTab:CreateSection("Visual Features")
+VisualTab:CreateSection("Visual")
 
 VisualTab:CreateToggle({
     Name = "Camera Lock",
     CurrentValue = false,
     Flag = "CameraLock",
-    Callback = function(Value)
-        State.camLock = Value
+    Callback = function(v)
+        State.camLock = v
         local camera = workspace.CurrentCamera
 
-        if State.camLock then
+        if v then
             local char = player.Character or player.CharacterAdded:Wait()
             local root = char:WaitForChild("HumanoidRootPart")
             local center = root.Position
-
             lockedCameraCenter = center
-
-            local angle = 0
             camera.CameraType = Enum.CameraType.Scriptable
 
-            if camConn then
-                camConn:Disconnect()
-            end
+            if camConn then camConn:Disconnect() end
+            local angle = 0
 
             camConn = RunService.RenderStepped:Connect(function(dt)
                 if not State.camLock then return end
-
-                angle += dt * 1.5
-
+                angle = angle + dt * 1.5
                 local x = math.cos(angle) * 10
                 local z = math.sin(angle) * 10
-
                 camera.CFrame = CFrame.new(center + Vector3.new(x, 4, z), center)
             end)
         else
-            if camConn then
-                camConn:Disconnect()
-                camConn = nil
-            end
-
+            if camConn then camConn:Disconnect() camConn = nil end
             camera.CameraType = Enum.CameraType.Custom
         end
-    end,
+    end
 })
 
 VisualTab:CreateToggle({
     Name = "TPCamera Area Walk",
     CurrentValue = false,
     Flag = "TPCamera",
-    Callback = function(Value)
-        State.tpCamera = Value
-
-        if Value then
-            startTPCameraRoute()
-        else
-            stopTPCameraRoute()
-        end
-    end,
+    Callback = function(v)
+        State.tpCamera = v
+        if v then startTPCameraRoute() else stopTPCameraRoute() end
+    end
 })
 
-VisualTab:CreateInput({
-    Name = "Raio da Rota",
-    PlaceholderText = "Padrao: 80",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 20 then
-            routeRadius = num
-
-            if State.tpCamera and lockedCameraCenter then
-                routePoints = buildRoutePoints(lockedCameraCenter, routeRadius, routeStep)
-                currentRouteIndex = 1
-            end
-        end
-    end,
-})
-
-VisualTab:CreateInput({
-    Name = "Espacamento da Rota",
-    PlaceholderText = "Padrao: 25",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local num = tonumber(Text)
-
-        if num and num >= 8 then
-            routeStep = num
-
-            if State.tpCamera and lockedCameraCenter then
-                routePoints = buildRoutePoints(lockedCameraCenter, routeRadius, routeStep)
-                currentRouteIndex = 1
-            end
-        end
-    end,
-})
-
---// OTHER TAB
-OtherTab:CreateSection("Other Features")
+OtherTab:CreateSection("Other")
 
 OtherTab:CreateButton({
     Name = "TurtleSpy",
@@ -1651,7 +1151,7 @@ OtherTab:CreateButton({
         pcall(function()
             loadstring(game:HttpGet("https://raw.githubusercontent.com/Turtle-Brand/Turtle-Spy/main/source.lua", true))()
         end)
-    end,
+    end
 })
 
 OtherTab:CreateButton({
@@ -1660,24 +1160,22 @@ OtherTab:CreateButton({
         pcall(function()
             loadstring(game:HttpGet("https://raw.githubusercontent.com/hassanxzayn-lua/Anti-afk/main/antiafkbyhassanxzyn"))()
         end)
-    end,
+    end
 })
 
 OtherTab:CreateButton({
     Name = "Copy Discord",
     Callback = function()
         setclipboard("https://discord.gg/myjsXgDEC3")
-        notify("Discord Copied", "https://discord.gg/myjsXgDEC3", 3)
-    end,
+        notify("Discord", "Copiado.", 2)
+    end
 })
 
---// AUTO ATTACK LOOP
 task.spawn(function()
     while task.wait(autoAttackDelay) do
         if State.autoAttackBoxes or State.autoAttackCameraLock then
             pcall(function()
                 local box = State.autoAttackCameraLock and getCameraBoxTarget() or getNearestBox()
-
                 if box and box.Field and box.Field.Id and box.Id then
                     RE.AttackBox:FireServer(box.Field.Id, box.Id, Clock.now())
                 end
@@ -1686,45 +1184,24 @@ task.spawn(function()
     end
 end)
 
---// AUTO SELL LOOP
 task.spawn(function()
     while task.wait(autoSellDelay) do
         protectSpecialItems()
-
-        if State.autoSellHats then
-            pcall(function()
-                sellInventoryCategory("Hats")
-            end)
-        end
-
-        if State.autoSellPets then
-            pcall(function()
-                sellInventoryCategory("Pets")
-            end)
-        end
-
-        if State.autoSellPerks then
-            pcall(function()
-                sellInventoryCategory("Perks")
-            end)
-        end
+        if State.autoSellHats then pcall(function() sellInventoryCategory("Hats") end) end
+        if State.autoSellPets then pcall(function() sellInventoryCategory("Pets") end) end
+        if State.autoSellPerks then pcall(function() sellInventoryCategory("Perks") end) end
     end
 end)
 
---// WHEEL LOOP
 task.spawn(function()
     while task.wait(0.03) do
         if State.autoWheel and os.clock() - lastWheelTick >= wheelDelay then
             lastWheelTick = os.clock()
-
-            for _ = 1, wheelBurst do
-                task.spawn(spinSelectedWheel)
-            end
+            for _ = 1, wheelBurst do task.spawn(spinSelectedWheel) end
         end
     end
 end)
 
---// QUEST LOOP
 task.spawn(function()
     while task.wait(0.1) do
         if State.autoQuestClaim and os.clock() - lastQuestClaimTick >= questClaimDelay then
@@ -1734,13 +1211,10 @@ task.spawn(function()
     end
 end)
 
---// WEBHOOK LOOP
 task.spawn(function()
     while task.wait(5) do
         if State.webhookEnabled then
-            local delaySeconds = webhookDelayMinutes * 60
-
-            if os.clock() - lastWebhookAt >= delaySeconds then
+            if os.clock() - lastWebhookAt >= webhookDelayMinutes * 60 then
                 lastWebhookAt = os.clock()
                 sendWebhook(buildWebhookReport())
             end
@@ -1748,21 +1222,15 @@ task.spawn(function()
     end
 end)
 
---// MAIN LOOP
 task.spawn(function()
     while task.wait(3) do
         if State.autoClose then
-            pcall(function()
-                StateUtil.ClosePage()
-            end)
+            pcall(function() StateUtil.ClosePage() end)
         end
 
         if State.autoCloseRushResults then
             pcall(function()
-                if RE:FindFirstChild("ClaimBoxRush") then
-                    RE.ClaimBoxRush:FireServer()
-                end
-
+                if RE:FindFirstChild("ClaimBoxRush") then RE.ClaimBoxRush:FireServer() end
                 StateUtil.ClosePage("BoxRushResults")
             end)
         end
@@ -1770,7 +1238,6 @@ task.spawn(function()
         if State.autoEasterRush then
             pcall(function()
                 local box = workspace:FindFirstChild("Easter")
-
                 if box and box:FindFirstChild("EasterBoxRush") then
                     recordRush("Easter Rush")
                     RE.StartBoxRush:FireServer(box.EasterBoxRush)
@@ -1782,7 +1249,6 @@ task.spawn(function()
             pcall(function()
                 local areas = workspace:FindFirstChild("Areas")
                 local goldMine = areas and areas:FindFirstChild("23_GoldMine")
-
                 if goldMine and goldMine:FindFirstChild("GoldRush") then
                     recordRush("Gold Rush")
                     RE.StartBoxRush:FireServer(goldMine.GoldRush, autoRushWorld)
@@ -1790,41 +1256,24 @@ task.spawn(function()
             end)
         end
 
-        if State.autoPerk then
-            pcall(forceActivateEquippedPerks)
-        end
+        if State.autoPerk then pcall(forceActivateEquippedPerks) end
 
         if State.autoClaim then
             for i = 1, 12 do
                 task.wait(0.1)
-
-                pcall(function()
-                    RE.ClaimPlaytimeReward:FireServer(i)
-                end)
+                pcall(function() RE.ClaimPlaytimeReward:FireServer(i) end)
             end
         end
 
         if State.autoBP then
             for i = 1, 6 do
                 task.wait(0.2)
-
-                pcall(function()
-                    RE.ClaimBattlePassTask:FireServer(i)
-                end)
+                pcall(function() RE.ClaimBattlePassTask:FireServer(i) end)
             end
         end
 
-        if State.autoDaily then
-            pcall(function()
-                RE.ClaimLoginReward:FireServer()
-            end)
-        end
-
-        if State.autoAch then
-            pcall(function()
-                RE.ClaimAllAchievements:FireServer()
-            end)
-        end
+        if State.autoDaily then pcall(function() RE.ClaimLoginReward:FireServer() end) end
+        if State.autoAch then pcall(function() RE.ClaimAllAchievements:FireServer() end) end
 
         if State.autoEasterCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "Easter2024Crate", MerchantId = "MoleMerchant" }) end) end
         if State.autoHatDropBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "HatDropBoost", MerchantId = "MoleMerchant" }) end) end
@@ -1839,4 +1288,4 @@ task.spawn(function()
     end
 end)
 
-notify("Unboxing Hub", "GUI carregado com Webhook corrigido e Test Webhook.", 4)
+notify("Unboxing Hub", "GUI carregado. Webhook corrigido.", 4)
