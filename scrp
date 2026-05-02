@@ -18,6 +18,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
 local RE = ReplicatedStorage:WaitForChild("RE")
@@ -39,7 +41,6 @@ local I = {
     sell = utf8.char(0x1F4B8),
     map = utf8.char(0x1F5FA),
     wheel = utf8.char(0x1F3A1),
-    quest = utf8.char(0x1F4DC),
     bell = utf8.char(0x1F514),
     stats = utf8.char(0x1F4CA),
     eye = utf8.char(0x1F441),
@@ -51,6 +52,7 @@ local I = {
     check = utf8.char(0x2705),
     x = utf8.char(0x274C),
     bomb = utf8.char(0x1F4A3),
+    save = utf8.char(0x1F4BE),
 }
 
 local State = {
@@ -62,28 +64,43 @@ local State = {
     autoBP = false,
     autoDaily = false,
     autoAch = false,
+    autoQuestClaim = false,
     autoPerk = false,
+
     autoSellHats = false,
     autoSellPets = false,
     autoSellPerks = false,
+
     autoAttackBoxes = false,
-    autoAttackCameraLock = false,
     autoWheel = false,
-    autoQuestClaim = false,
     webhookEnabled = false,
+
     camLock = false,
     tpCamera = false,
+
+    autoEasterCrate = false,
+    autoBasicPerkCrate = false,
+    autoHatDropBoost = false,
+    autoComumEventPotion = false,
+    autoRareEventPotion = false,
+    autoEpicEventPotion = false,
+    autoLegendaryEventPotion = false,
+    autoGodlyEventPotion = false,
+    autoMythicEventPotion = false,
+    autoMoleBoost = false,
+    autoEventBooster = false,
 }
 
 local crateAmount = 1
 local autoRushWorld = 108
-local autoAttackRange = 65
 local autoAttackDelay = 0.05
+local autoAttackRange = 65
 local autoSellDelay = 5
 
 local webhookUrl = ""
 local webhookDelayMinutes = 60
 local lastWebhookAt = os.clock()
+local kickWebhookSent = false
 
 local autoFavoriteRareDrops = true
 local autoFavoriteGoodPerks = true
@@ -97,14 +114,10 @@ local lastWheelTick = 0
 local questClaimDelay = 0.5
 local lastQuestClaimTick = 0
 
-local merchantScanDelay = 0.25
-local merchantLastScan = 0
-local merchantSelectedItems = {}
-local merchantBoughtCache = {}
-local merchantAutoBuyEnabled = false
+local selectedSaveName = "Save1"
+local saveFolder = "UnboxingHub/Saves"
 
 local camConn
-local camAttackConn
 local tpConn
 local areaConn
 local lockedCameraCenter
@@ -142,27 +155,13 @@ local Stats = {
 local sellRarities = {
     Hats = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
     Pets = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
-    Perks = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
+    Perks = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false },
 }
 
 local rarityAliases = {
     Mythical = "Mythic",
     Ethereal = "Etherium",
     Ethereum = "Etherium",
-}
-
-local merchantItems = {
-    "Easter2024Crate",
-    "BasicPerkCrate",
-    "HatDropBoost",
-    "ComumEventPotion",
-    "RareEventPotion",
-    "EpicEventPotion",
-    "LegendaryEventPotion",
-    "GodlyEventPotion",
-    "MythicEventPotion",
-    "MoleBoost",
-    "EventBooster",
 }
 
 local blur = Instance.new("BlurEffect")
@@ -194,7 +193,6 @@ local AutoSellTab = Window:CreateTab(I.sell .. " Auto Sell", 4483362458)
 local AutoAttackTab = Window:CreateTab(I.attack .. " Auto Attack", 4483362458)
 local AreaFarmTab = Window:CreateTab(I.map .. " Area Farm", 4483362458)
 local WheelTab = Window:CreateTab(I.wheel .. " Wheel", 4483362458)
-local QuestTab = Window:CreateTab(I.quest .. " Quest", 4483362458)
 local WebhookTab = Window:CreateTab(I.bell .. " Webhook", 4483362458)
 local StatsTab = Window:CreateTab(I.stats .. " Stats", 4483362458)
 local VisualTab = Window:CreateTab(I.eye .. " Visual", 4483362458)
@@ -229,19 +227,26 @@ end
 
 local function getItemData(invItem)
     if not invItem or not invItem.ItemId then return nil end
+
     local ok, data = pcall(function()
         return ItemData.Get(invItem.ItemId)
     end)
+
     if ok then return data end
     return nil
 end
 
 local function getRarityName(itemData)
     if not itemData or not itemData.Rarity then return nil end
+
     local ok, rarityName = pcall(function()
         return ItemData.GetRawRarityName(itemData.Rarity)
     end)
-    if ok then return rarityAliases[rarityName] or rarityName end
+
+    if ok then
+        return rarityAliases[rarityName] or rarityName
+    end
+
     return nil
 end
 
@@ -286,11 +291,15 @@ local function getBestPerkStat(invItem)
         key = string.lower(tostring(key or ""))
 
         for blocked in pairs(blockedKeys) do
-            if key:find(blocked) then return false end
+            if key:find(blocked) then
+                return false
+            end
         end
 
         for allowed in pairs(allowedKeys) do
-            if key:find(allowed) then return true end
+            if key:find(allowed) then
+                return true
+            end
         end
 
         return false
@@ -309,10 +318,6 @@ local function getBestPerkStat(invItem)
     end
 
     scan(invItem, "root")
-
-    local data = getItemData(invItem)
-    if data then scan(data, "itemData") end
-
     return best
 end
 
@@ -456,39 +461,6 @@ local function getNearestBox()
     return nearest
 end
 
-local function getCameraBoxTarget()
-    local camera = workspace.CurrentCamera
-    local viewport = camera.ViewportSize
-    local center = Vector2.new(viewport.X / 2, viewport.Y / 2)
-
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local field = root and BoxController.GetCurrentField(root.Position)
-    if not field then return nil end
-
-    local bestBox
-    local bestScore = 260
-
-    for _, box in pairs(field.VisibleBoxes or field.Boxes or {}) do
-        if box and box.CFrame and box.Health and box.Damage then
-            if box.Health > box.Damage and not box.IsOpen then
-                local screenPos, onScreen = camera:WorldToViewportPoint(box.CFrame.Position)
-
-                if onScreen and screenPos.Z > 0 then
-                    local score = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-
-                    if score < bestScore then
-                        bestScore = score
-                        bestBox = box
-                    end
-                end
-            end
-        end
-    end
-
-    return bestBox
-end
-
 local function buildRoutePoints(center, radius, step)
     local points = {}
 
@@ -519,19 +491,17 @@ end
 
 local function getAreaModel(index)
     local areas = workspace:FindFirstChild("Areas")
-    if not areas then return nil end
-
     index = tonumber(index)
     if not index then return nil end
 
-    local function areaMatches(inst)
+    local function matches(inst)
         local name = tostring(inst.Name)
-        local numberFromStart = tonumber(name:match("^(%d+)[_%-%s]"))
-        local numberFromArea = tonumber(name:match("[Aa]rea[%s_%-]*(%d+)"))
+        local lower = string.lower(name)
 
-        if numberFromStart == index or numberFromArea == index then
-            return true
-        end
+        if name == tostring(index) then return true end
+        if name:match("^" .. tostring(index) .. "[_%-%s]") then return true end
+        if lower:find("area") and lower:find(tostring(index)) then return true end
+        if lower:find("world") and lower:find(tostring(index)) then return true end
 
         for _, attr in ipairs({ "Id", "ID", "AreaId", "AreaID", "World", "WorldId", "WorldID", "Index" }) do
             local ok, value = pcall(function()
@@ -546,13 +516,21 @@ local function getAreaModel(index)
         return false
     end
 
-    for _, inst in ipairs(areas:GetChildren()) do
-        if areaMatches(inst) then return inst end
+    if areas then
+        for _, inst in ipairs(areas:GetChildren()) do
+            if matches(inst) then return inst end
+        end
+
+        for _, inst in ipairs(areas:GetDescendants()) do
+            if (inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("BasePart")) and matches(inst) then
+                return inst
+            end
+        end
     end
 
-    for _, inst in ipairs(areas:GetDescendants()) do
-        if inst:IsA("Model") or inst:IsA("Folder") then
-            if areaMatches(inst) then return inst end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if (inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("BasePart")) and matches(inst) then
+            return inst
         end
     end
 
@@ -562,27 +540,40 @@ end
 local function getModelCenter(model)
     if not model then return nil end
 
-    for _, name in ipairs({ "Center", "Spawn", "Teleport", "Hitbox", "Field", "Zone", "Base" }) do
+    if model:IsA("BasePart") then
+        return model.Position
+    end
+
+    for _, name in ipairs({ "Spawn", "Teleport", "Center", "Hitbox", "Field", "Zone", "Base", "Floor" }) do
         local inst = model:FindFirstChild(name, true)
 
         if inst and inst:IsA("BasePart") then
             return inst.Position
-        elseif inst and inst:IsA("Model") then
-            local ok, cf = pcall(function()
-                return inst:GetPivot()
-            end)
-            if ok and cf then return cf.Position end
         end
     end
+
+    local bestPart
+    local bestSize = 0
+
+    for _, inst in ipairs(model:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local size = inst.Size.X * inst.Size.Y * inst.Size.Z
+
+            if size > bestSize then
+                bestSize = size
+                bestPart = inst
+            end
+        end
+    end
+
+    if bestPart then return bestPart.Position end
 
     local ok, cf = pcall(function()
         return model:GetPivot()
     end)
 
     if ok and cf then return cf.Position end
-
-    local part = model:FindFirstChildWhichIsA("BasePart", true)
-    return part and part.Position or nil
+    return nil
 end
 
 local function startTPCameraRoute()
@@ -714,17 +705,9 @@ local function trackCrateReward(value)
     if type(value) == "string" then
         local s = string.lower(value)
 
-        if s:find("eggrain") or s:find("egg rain") then
-            Stats.eggRainGained = Stats.eggRainGained + 1
-        end
-
-        if s:find("bombrain") or s:find("bomb rain") or s:find("bomb%-rain") then
-            Stats.bombRainGained = Stats.bombRainGained + 1
-        end
-
-        if s:find("ticket") then
-            Stats.ticketsGained = Stats.ticketsGained + 1
-        end
+        if s:find("eggrain") or s:find("egg rain") then Stats.eggRainGained = Stats.eggRainGained + 1 end
+        if s:find("bombrain") or s:find("bomb rain") or s:find("bomb%-rain") then Stats.bombRainGained = Stats.bombRainGained + 1 end
+        if s:find("ticket") then Stats.ticketsGained = Stats.ticketsGained + 1 end
     elseif type(value) == "table" then
         for k, v in pairs(value) do
             local key = string.lower(tostring(k))
@@ -753,45 +736,20 @@ local function openCrateAndTrack(crateId, amount)
     end
 end
 
-local function getNearestWheelId()
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local nearestId
-    local nearestDist = math.huge
-
-    for _, inst in ipairs(workspace:GetDescendants()) do
-        local ok, wheelId = pcall(function()
-            return inst:GetAttribute("WheelId")
-        end)
-
-        if ok and wheelId then
-            local pos
-
-            if inst:IsA("BasePart") then
-                pos = inst.Position
-            elseif inst:IsA("Model") then
-                pos = inst:GetPivot().Position
-            end
-
-            if pos then
-                local dist = root and (pos - root.Position).Magnitude or 0
-
-                if dist < nearestDist then
-                    nearestDist = dist
-                    nearestId = wheelId
-                end
-            end
-        end
-    end
-
-    return nearestId
-end
-
 local function spinSelectedWheel()
     local wheelId = selectedWheelId
 
     if wheelId == "Auto Detect" then
-        wheelId = getNearestWheelId()
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            local ok, id = pcall(function()
+                return inst:GetAttribute("WheelId")
+            end)
+
+            if ok and id then
+                wheelId = id
+                break
+            end
+        end
     end
 
     if not wheelId then return end
@@ -814,106 +772,20 @@ local function claimAllQuestLike()
     end
 end
 
-local function getMerchantData()
-    if not RF:FindFirstChild("GetMerchantData") then return nil end
+local function sendWebhookForce(message)
+    if webhookUrl == "" then return end
 
-    local tries = {
-        function() return RF.GetMerchantData:InvokeServer("MoleMerchant") end,
-        function() return RF.GetMerchantData:InvokeServer({ MerchantId = "MoleMerchant" }) end,
-        function() return RF.GetMerchantData:InvokeServer() end,
-    }
+    local req = http_request or request or syn and syn.request or fluxus and fluxus.request
+    if not req then return end
 
-    for _, fn in ipairs(tries) do
-        local ok, data = pcall(fn)
-        if ok and type(data) == "table" then return data end
-    end
-
-    return nil
-end
-
-local function collectMerchantItems(data, found)
-    found = found or {}
-
-    if type(data) ~= "table" then return found end
-
-    local itemId = data.ItemId or data.ItemID or data.Id or data.ID or data.Name
-
-    if itemId then
-        table.insert(found, data)
-    end
-
-    for _, v in pairs(data) do
-        if type(v) == "table" then
-            collectMerchantItems(v, found)
-        end
-    end
-
-    return found
-end
-
-local function merchantItemAvailable(item)
-    if type(item) ~= "table" then return false end
-
-    if item.SoldOut == true then return false end
-    if item.IsSoldOut == true then return false end
-    if item.Purchased == true then return false end
-    if item.Bought == true then return false end
-    if item.CanBuy == false then return false end
-    if item.Available == false then return false end
-
-    local stock = item.Stock or item.Amount or item.Quantity or item.Remaining or item.Left
-
-    if stock ~= nil and tonumber(stock) ~= nil and tonumber(stock) <= 0 then
-        return false
-    end
-
-    return true
-end
-
-local function merchantSignature(item)
-    local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or item.Name or "")
-    local stock = tostring(item.Stock or item.Amount or item.Quantity or item.Remaining or item.Left or "")
-    local price = tostring(item.Price or item.Cost or item.CostAmount or "")
-    local reset = tostring(item.RefreshAt or item.ResetAt or item.RestockAt or item.RestockTime or "")
-
-    return itemId .. "|" .. stock .. "|" .. price .. "|" .. reset
-end
-
-local function buyMerchantItem(itemId)
-    local ok = pcall(function()
-        RF.PurchaseMerchantItem:InvokeServer({
-            ItemId = itemId,
-            MerchantId = "MoleMerchant",
+    pcall(function()
+        req({
+            Url = webhookUrl,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ content = tostring(message) }),
         })
     end)
-
-    if ok then
-        Stats.merchantBought = Stats.merchantBought + 1
-    end
-end
-
-local function buyMerchantSelectedOnce()
-    if not merchantAutoBuyEnabled then return end
-
-    local data = getMerchantData()
-    if not data then return end
-
-    local foundItems = collectMerchantItems(data)
-
-    for _, item in ipairs(foundItems) do
-        local itemId = tostring(item.ItemId or item.ItemID or item.Id or item.ID or item.Name or "")
-
-        if merchantSelectedItems[itemId] and merchantItemAvailable(item) then
-            local sig = merchantSignature(item)
-
-            if not merchantBoughtCache[sig] then
-                merchantBoughtCache[sig] = true
-                task.spawn(function()
-                    buyMerchantItem(itemId)
-                end)
-            end
-        end
-    end
 end
 
 local function sendWebhook(message)
@@ -929,14 +801,7 @@ local function sendWebhook(message)
         return
     end
 
-    pcall(function()
-        req({
-            Url = webhookUrl,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode({ content = tostring(message) }),
-        })
-    end)
+    sendWebhookForce(message)
 end
 
 local function buildWebhookReport()
@@ -973,6 +838,148 @@ local function buildWebhookReport()
     return table.concat(lines, "\n")
 end
 
+local function notifyKickWebhook(reason)
+    if kickWebhookSent then return end
+    kickWebhookSent = true
+
+    local lines = {}
+
+    table.insert(lines, "ALERTA: Player saiu/kickado do jogo")
+    table.insert(lines, "Player: " .. tostring(player.Name))
+    table.insert(lines, "UserId: " .. tostring(player.UserId))
+    table.insert(lines, "Motivo: " .. tostring(reason or "Desconhecido"))
+    table.insert(lines, "Tempo: " .. formatTime(os.clock() - Stats.startedAt))
+    table.insert(lines, "Caixas quebradas: " .. tostring(Stats.boxesBroken))
+    table.insert(lines, "Crates abertas: " .. tostring(Stats.cratesOpened))
+    table.insert(lines, "Itens vendidos: " .. tostring(Stats.itemsSold))
+
+    sendWebhookForce(table.concat(lines, "\n"))
+end
+
+local function safeFileName(name)
+    name = tostring(name or "Save1")
+    name = name:gsub("[^%w_%-%s]", "")
+    if name == "" then name = "Save1" end
+    return name
+end
+
+local function ensureSaveFolder()
+    if makefolder then
+        pcall(function()
+            if not isfolder("UnboxingHub") then makefolder("UnboxingHub") end
+            if not isfolder(saveFolder) then makefolder(saveFolder) end
+        end)
+    end
+end
+
+local function getSavePath(name)
+    return saveFolder .. "/" .. safeFileName(name) .. ".json"
+end
+
+local function buildSaveData()
+    return {
+        State = State,
+        sellRarities = sellRarities,
+        crateAmount = crateAmount,
+        autoRushWorld = autoRushWorld,
+        autoAttackDelay = autoAttackDelay,
+        autoSellDelay = autoSellDelay,
+        webhookUrl = webhookUrl,
+        webhookDelayMinutes = webhookDelayMinutes,
+        autoFavoriteRareDrops = autoFavoriteRareDrops,
+        autoFavoriteGoodPerks = autoFavoriteGoodPerks,
+        perkFavoriteMinStat = perkFavoriteMinStat,
+        wheelDelay = wheelDelay,
+        wheelBurst = wheelBurst,
+        selectedWheelId = selectedWheelId,
+        farmAreaIndex = farmAreaIndex,
+        farmAreaRadius = farmAreaRadius,
+        farmAreaStep = farmAreaStep,
+    }
+end
+
+local function applySaveData(data)
+    if type(data) ~= "table" then return end
+
+    if type(data.State) == "table" then
+        for k, v in pairs(data.State) do
+            if State[k] ~= nil then State[k] = v end
+        end
+    end
+
+    if type(data.sellRarities) == "table" then
+        for category, rarities in pairs(data.sellRarities) do
+            if sellRarities[category] and type(rarities) == "table" then
+                for rarity, value in pairs(rarities) do
+                    if sellRarities[category][rarity] ~= nil then
+                        sellRarities[category][rarity] = value
+                    end
+                end
+            end
+        end
+    end
+
+    crateAmount = tonumber(data.crateAmount) or crateAmount
+    autoRushWorld = tonumber(data.autoRushWorld) or autoRushWorld
+    autoAttackDelay = tonumber(data.autoAttackDelay) or autoAttackDelay
+    autoSellDelay = tonumber(data.autoSellDelay) or autoSellDelay
+    webhookUrl = tostring(data.webhookUrl or webhookUrl)
+    webhookDelayMinutes = tonumber(data.webhookDelayMinutes) or webhookDelayMinutes
+    autoFavoriteRareDrops = data.autoFavoriteRareDrops == true
+    autoFavoriteGoodPerks = data.autoFavoriteGoodPerks == true
+    perkFavoriteMinStat = tonumber(data.perkFavoriteMinStat) or perkFavoriteMinStat
+    wheelDelay = tonumber(data.wheelDelay) or wheelDelay
+    wheelBurst = tonumber(data.wheelBurst) or wheelBurst
+    selectedWheelId = tostring(data.selectedWheelId or selectedWheelId)
+    farmAreaIndex = tonumber(data.farmAreaIndex) or farmAreaIndex
+    farmAreaRadius = tonumber(data.farmAreaRadius) or farmAreaRadius
+    farmAreaStep = tonumber(data.farmAreaStep) or farmAreaStep
+end
+
+local function saveProfile(name)
+    if not writefile then
+        notify(I.save .. " Save", "Executor nao suporta writefile.", 4)
+        return
+    end
+
+    ensureSaveFolder()
+
+    local ok, err = pcall(function()
+        writefile(getSavePath(name), HttpService:JSONEncode(buildSaveData()))
+    end)
+
+    if ok then
+        notify(I.save .. " Save", "Config salva: " .. safeFileName(name), 3)
+    else
+        notify(I.x .. " Save", "Erro: " .. tostring(err), 4)
+    end
+end
+
+local function loadProfile(name)
+    if not readfile or not isfile then
+        notify(I.save .. " Save", "Executor nao suporta readfile/isfile.", 4)
+        return
+    end
+
+    local path = getSavePath(name)
+
+    if not isfile(path) then
+        notify(I.x .. " Save", "Nao encontrado: " .. safeFileName(name), 4)
+        return
+    end
+
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+
+    if ok and type(data) == "table" then
+        applySaveData(data)
+        notify(I.check .. " Save", "Config carregada: " .. safeFileName(name), 3)
+    else
+        notify(I.x .. " Save", "Erro ao carregar.", 4)
+    end
+end
+
 pcall(function()
     RE.BoxesDestroyed.OnClientEvent:Connect(function(_, boxBuffer)
         local count = 0
@@ -1004,7 +1011,7 @@ FarmTab:CreateToggle({ Name = I.check .. " Auto Close Rush Results", CurrentValu
 FarmTab:CreateToggle({ Name = I.shield .. " NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
 
 FarmTab:CreateButton({
-    Name = I.bomb .. " BOMB RAIN",
+    Name = I.bomb .. " BOMB RAIN > NOT IS PERK",
     Callback = function()
         pcall(function()
             RE.PromptProductPurchase:FireServer("BombRainInstant")
@@ -1012,64 +1019,26 @@ FarmTab:CreateButton({
     end,
 })
 
-EventTab:CreateSection(I.event .. " Mole Merchant Auto Buy")
+EventTab:CreateSection(I.event .. " Mole Merchant")
 
-EventTab:CreateToggle({
-    Name = I.check .. " Ativar Auto Buy Merchant",
-    CurrentValue = false,
-    Flag = "MerchantAutoBuyEnabled",
-    Callback = function(Value)
-        merchantAutoBuyEnabled = Value
-    end,
-})
-
-EventTab:CreateInput({
-    Name = I.gear .. " Delay Scan Merchant",
-    PlaceholderText = "Padrao: 0.25",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 0.1 then merchantScanDelay = n end
-    end,
-})
-
-for _, itemId in ipairs(merchantItems) do
-    EventTab:CreateToggle({
-        Name = I.gift .. " Comprar " .. itemId,
-        CurrentValue = false,
-        Flag = "Merchant_" .. itemId,
-        Callback = function(Value)
-            merchantSelectedItems[itemId] = Value
-        end,
-    })
-end
-
-EventTab:CreateButton({
-    Name = I.money .. " Comprar Selecionados Agora",
-    Callback = function()
-        for _, itemId in ipairs(merchantItems) do
-            if merchantSelectedItems[itemId] then
-                task.spawn(function()
-                    buyMerchantItem(itemId)
-                end)
-            end
-        end
-    end,
-})
-
-EventTab:CreateButton({
-    Name = I.gear .. " Limpar Cache Merchant",
-    Callback = function()
-        merchantBoughtCache = {}
-        notify(I.check .. " Merchant", "Cache limpo.", 2)
-    end,
-})
+EventTab:CreateToggle({ Name = I.egg .. " EasterCrate", CurrentValue = false, Flag = "EasterCrate", Callback = function(v) State.autoEasterCrate = v end })
+EventTab:CreateToggle({ Name = I.star .. " BasicPerkCrate", CurrentValue = false, Flag = "BasicPerkCrate", Callback = function(v) State.autoBasicPerkCrate = v end })
+EventTab:CreateToggle({ Name = I.hat .. " HatDropBoost", CurrentValue = false, Flag = "HatDropBoost", Callback = function(v) State.autoHatDropBoost = v end })
+EventTab:CreateToggle({ Name = "ComumEventPotion", CurrentValue = false, Flag = "ComumEventPotion", Callback = function(v) State.autoComumEventPotion = v end })
+EventTab:CreateToggle({ Name = "RareEventPotion", CurrentValue = false, Flag = "RareEventPotion", Callback = function(v) State.autoRareEventPotion = v end })
+EventTab:CreateToggle({ Name = "EpicEventPotion", CurrentValue = false, Flag = "EpicEventPotion", Callback = function(v) State.autoEpicEventPotion = v end })
+EventTab:CreateToggle({ Name = "LegendaryEventPotion", CurrentValue = false, Flag = "LegendaryEventPotion", Callback = function(v) State.autoLegendaryEventPotion = v end })
+EventTab:CreateToggle({ Name = "GodlyEventPotion", CurrentValue = false, Flag = "GodlyEventPotion", Callback = function(v) State.autoGodlyEventPotion = v end })
+EventTab:CreateToggle({ Name = "MythicEventPotion", CurrentValue = false, Flag = "MythicEventPotion", Callback = function(v) State.autoMythicEventPotion = v end })
+EventTab:CreateToggle({ Name = "MoleBoost", CurrentValue = false, Flag = "MoleBoost", Callback = function(v) State.autoMoleBoost = v end })
+EventTab:CreateToggle({ Name = "EventBooster", CurrentValue = false, Flag = "EventBooster", Callback = function(v) State.autoEventBooster = v end })
 
 RewardsTab:CreateSection(I.gift .. " Rewards")
 RewardsTab:CreateToggle({ Name = I.money .. " Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(v) State.autoClaim = v end })
 RewardsTab:CreateToggle({ Name = I.attack .. " Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
 RewardsTab:CreateToggle({ Name = I.gift .. " Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
 RewardsTab:CreateToggle({ Name = I.star .. " Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
+RewardsTab:CreateToggle({ Name = I.check .. " Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
 
 CratesTab:CreateSection(I.box .. " Crates")
 
@@ -1096,7 +1065,6 @@ crateButton("EasterCrate", "Easter2024Crate")
 crateButton("MaterialCrate", "MaterialCrate")
 crateButton("BasicPerk", "BasicPerkCrate")
 crateButton("BoxPerk", "BoxPerkCrate")
-crateButton("ExclusiveEasterCrate", "ExclusiveEasterCrate")
 crateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
 crateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
 
@@ -1124,7 +1092,8 @@ AutoSellTab:CreateInput({
     end,
 })
 
-local rarityOrder = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic", "Etherium", "Celestial" }
+local rarityOrderDefault = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic", "Etherium", "Celestial" }
+local rarityOrderPerks = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic" }
 
 local function rarityToggles(category, icon)
     AutoSellTab:CreateSection(icon .. " Sell " .. category)
@@ -1138,7 +1107,9 @@ local function rarityToggles(category, icon)
         end,
     })
 
-    for _, rarity in ipairs(rarityOrder) do
+    local order = category == "Perks" and rarityOrderPerks or rarityOrderDefault
+
+    for _, rarity in ipairs(order) do
         AutoSellTab:CreateToggle({
             Name = rarity,
             CurrentValue = sellRarities[category][rarity],
@@ -1161,64 +1132,12 @@ AutoAttackTab:CreateSection(I.attack .. " Auto Attack")
 AutoAttackTab:CreateToggle({ Name = I.attack .. " Auto Attack Aura", CurrentValue = false, Flag = "AutoAttackBoxes", Callback = function(v) State.autoAttackBoxes = v end })
 
 AutoAttackTab:CreateInput({
-    Name = I.attack .. " Distancia",
-    PlaceholderText = "Padrao: 65",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n > 0 then autoAttackRange = n end
-    end,
-})
-
-AutoAttackTab:CreateInput({
     Name = I.gear .. " Delay",
     PlaceholderText = "Padrao: 0.05",
     RemoveTextAfterFocusLost = false,
     Callback = function(Text)
         local n = tonumber(Text)
         if n and n >= 0.01 then autoAttackDelay = n end
-    end,
-})
-
-AutoAttackTab:CreateToggle({
-    Name = I.eye .. " Auto Attack Camera Lock",
-    CurrentValue = false,
-    Flag = "AutoAttackCameraLock",
-    Callback = function(v)
-        State.autoAttackCameraLock = v
-        local camera = workspace.CurrentCamera
-
-        if v then
-            local char = player.Character or player.CharacterAdded:Wait()
-            local root = char:WaitForChild("HumanoidRootPart")
-
-            lockedCameraCenter = lockedCameraCenter or root.Position
-            root.CFrame = CFrame.new(lockedCameraCenter + Vector3.new(0, 3, 0))
-            camera.CameraType = Enum.CameraType.Scriptable
-
-            if camAttackConn then camAttackConn:Disconnect() end
-
-            local angle = 0
-
-            camAttackConn = RunService.RenderStepped:Connect(function(dt)
-                if not State.autoAttackCameraLock then return end
-
-                angle = angle + dt * 1.2
-
-                local x = math.cos(angle) * 10
-                local z = math.sin(angle) * 10
-
-                camera.CFrame = CFrame.new(lockedCameraCenter + Vector3.new(x, 4, z), lockedCameraCenter)
-            end)
-
-            State.tpCamera = true
-            startTPCameraRoute()
-        else
-            if camAttackConn then camAttackConn:Disconnect() camAttackConn = nil end
-            camera.CameraType = Enum.CameraType.Custom
-            State.tpCamera = false
-            stopTPCameraRoute()
-        end
     end,
 })
 
@@ -1271,6 +1190,35 @@ AreaFarmTab:CreateButton({
     end,
 })
 
+AreaFarmTab:CreateButton({
+    Name = I.eye .. " Debug Area Atual",
+    Callback = function()
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+
+        local closest
+        local closestDist = math.huge
+
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if inst:IsA("BasePart") then
+                local dist = (inst.Position - root.Position).Magnitude
+
+                if dist < closestDist then
+                    closestDist = dist
+                    closest = inst
+                end
+            end
+        end
+
+        if closest then
+            notify(I.eye .. " Area Debug", closest:GetFullName(), 8)
+        else
+            notify(I.eye .. " Area Debug", "Nada encontrado perto.", 4)
+        end
+    end,
+})
+
 WheelTab:CreateSection(I.wheel .. " Wheel")
 
 WheelTab:CreateDropdown({
@@ -1289,11 +1237,6 @@ WheelTab:CreateInput({ Name = I.gear .. " Delay Wheel", PlaceholderText = "Padra
 WheelTab:CreateInput({ Name = I.wheel .. " Burst", PlaceholderText = "Padrao: 1", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 1 then wheelBurst = math.floor(n) end end })
 WheelTab:CreateToggle({ Name = I.wheel .. " Auto Wheel", CurrentValue = false, Flag = "AutoWheel", Callback = function(v) State.autoWheel = v end })
 WheelTab:CreateButton({ Name = I.wheel .. " Girar Agora", Callback = spinSelectedWheel })
-
-QuestTab:CreateSection(I.quest .. " Quest")
-QuestTab:CreateInput({ Name = I.gear .. " Delay Claim", PlaceholderText = "Padrao: 0.5", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 0.1 then questClaimDelay = n end end })
-QuestTab:CreateToggle({ Name = I.quest .. " Auto Claim Quest", CurrentValue = false, Flag = "AutoQuestClaim", Callback = function(v) State.autoQuestClaim = v end })
-QuestTab:CreateButton({ Name = I.quest .. " Claim Agora", Callback = claimAllQuestLike })
 
 WebhookTab:CreateSection(I.bell .. " Discord Webhook")
 
@@ -1378,6 +1321,20 @@ VisualTab:CreateToggle({
 
 VisualTab:CreateToggle({ Name = I.map .. " TPCamera Area Walk", CurrentValue = false, Flag = "TPCamera", Callback = function(v) State.tpCamera = v if v then startTPCameraRoute() else stopTPCameraRoute() end end })
 
+OtherTab:CreateSection(I.save .. " Save Config")
+
+OtherTab:CreateInput({
+    Name = I.save .. " Nome do Save",
+    PlaceholderText = "Ex: Save1",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        selectedSaveName = safeFileName(Text)
+    end,
+})
+
+OtherTab:CreateButton({ Name = I.save .. " Save", Callback = function() saveProfile(selectedSaveName) end })
+OtherTab:CreateButton({ Name = I.check .. " Carregar Save", Callback = function() loadProfile(selectedSaveName) end })
+
 OtherTab:CreateSection(I.gear .. " Other")
 
 OtherTab:CreateButton({
@@ -1408,9 +1365,9 @@ OtherTab:CreateButton({
 
 task.spawn(function()
     while task.wait(autoAttackDelay) do
-        if State.autoAttackBoxes or State.autoAttackCameraLock then
+        if State.autoAttackBoxes then
             pcall(function()
-                local box = State.autoAttackCameraLock and getCameraBoxTarget() or getNearestBox()
+                local box = getNearestBox()
 
                 if box and box.Field and box.Field.Id and box.Id then
                     RE.AttackBox:FireServer(box.Field.Id, box.Id, Clock.now())
@@ -1452,11 +1409,18 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while task.wait(0.05) do
-        if merchantAutoBuyEnabled and os.clock() - merchantLastScan >= merchantScanDelay then
-            merchantLastScan = os.clock()
-            buyMerchantSelectedOnce()
-        end
+    while task.wait(1) do
+        if State.autoEasterCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "Easter2024Crate", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoBasicPerkCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "BasicPerkCrate", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoHatDropBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "HatDropBoost", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoComumEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "ComumEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoRareEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "RareEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoEpicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EpicEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoLegendaryEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "LegendaryEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoGodlyEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "GodlyEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoMythicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MythicEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoMoleBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MoleBoost", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
+        if State.autoEventBooster then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EventBooster", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
     end
 end)
 
@@ -1533,4 +1497,47 @@ task.spawn(function()
     end
 end)
 
-notify(I.gift .. " Unboxing Hub", "GUI carregado com emojis, Merchant corrigido e Auto Attack antigo.", 4)
+pcall(function()
+    GuiService.ErrorMessageChanged:Connect(function(message)
+        if message and tostring(message) ~= "" then
+            notifyKickWebhook(message)
+        end
+    end)
+end)
+
+pcall(function()
+    local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
+
+    if promptGui then
+        promptGui.DescendantAdded:Connect(function(inst)
+            if kickWebhookSent then return end
+
+            task.wait(0.2)
+
+            local text = ""
+
+            pcall(function()
+                if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+                    text = inst.Text
+                end
+            end)
+
+            if text and text ~= "" then
+                local lower = string.lower(text)
+
+                if lower:find("kick")
+                    or lower:find("disconnect")
+                    or lower:find("error")
+                    or lower:find("lost connection")
+                    or lower:find("idle")
+                    or lower:find("inatividade")
+                    or lower:find("desconectado")
+                    or lower:find("erro") then
+                    notifyKickWebhook(text)
+                end
+            end
+        end)
+    end
+end)
+
+notify(I.gift .. " Unboxing Hub", "GUI refeito e carregado.", 4)
