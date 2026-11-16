@@ -2957,6 +2957,176 @@ function Control.saveInstance(inst)
 	task.spawn(Dump.run, { { label = inst.Name, inst = inst, tag = Roots.tagOf(inst) } }, label)
 end
 
+------------------------------------------------------------------------------------------------------
+-- LER MODULOS DE DADOS (opt-in button): reads the DATA TABLES the game already holds in client memory.
+--  * Only a fixed allow-list of ModuleScripts (balance/config data), plus PlayerData.data (your own inventory)
+--    and the non-function fields of BoxController.
+--  * `require` returns the table the game itself already loaded; nothing is hooked, patched or decompiled.
+--  * No function of the game is ever CALLED and no remote is touched; functions are only listed as "<function>".
+--  * Anything that is only reachable through a function (a module that exposes just getters) is therefore NOT
+--    dumped; the report says how many functions such a module has so you can see it.
+------------------------------------------------------------------------------------------------------
+local ModuleReader = { busy = false }
+local MODULE_NAMES = { "ItemData", "EggData", "CrateData", "DropRateModule", "AreaData", "FieldData", "BoostData", "PerkData", "WorldData",
+	"UpgradeData", "VariantData", "VariantRates", "LoginRewardData", "QuestlineData", "AbilityData", "GlobalBossData", "UniverseData",
+	"LockedAreaData", "StarterPerkPathData", "HoldUpRewardData", "EventData", "InfoData", "UpdateData", "BoxTrialsTuning", "HauntTrialsTuning",
+	"GameConfig", "FeatureConfig", "HighscoreData" }
+local MODULE_MAX_ENTRIES = 400000
+
+local function moduleTargets()
+	local list = {}
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	if shared then
+		for _, name in ipairs(MODULE_NAMES) do
+			local m = shared:FindFirstChild(name)
+			if m and m:IsA("ModuleScript") then list[#list + 1] = { name = name, inst = m, kind = "data" } end
+		end
+	end
+	local mods = ReplicatedStorage:FindFirstChild("Modules")
+	local pd = mods and mods:FindFirstChild("PlayerData")
+	if pd and pd:IsA("ModuleScript") then list[#list + 1] = { name = "PlayerData", inst = pd, kind = "own_player_data", field = "data" } end
+	local ctrl = ReplicatedStorage:FindFirstChild("Controllers")
+	local bc = ctrl and ctrl:FindFirstChild("BoxController")
+	if bc and bc:IsA("ModuleScript") then list[#list + 1] = { name = "BoxController", inst = bc, kind = "live_state_fields_only" } end
+	return list
+end
+
+local function safeRequire(inst)
+	local done, ok, res = false, false, nil
+	task.spawn(function()
+		ok, res = pcall(require, inst)
+		done = true
+	end)
+	local t0 = clock()
+	while not done and clock() - t0 < 8 do task.wait(0.1) end
+	if not done then return false, "timeout (the module yielded for more than 8 s)" end
+	return ok, res
+end
+
+local function snapshot(v, st, depth)
+	local tv = typeof(v)
+	if tv == "table" then
+		if st.stack[v] then return "<cycle>" end
+		if depth > 10 then st.over = true return "<max_depth>" end
+		if st.n >= MODULE_MAX_ENTRIES then st.over = true return "<budget_exceeded>" end
+		st.stack[v] = true
+		local entries, count, isArr, maxIdx = {}, 0, true, 0
+		local k, val = next(v) -- raw traversal: never triggers __index/__pairs of the game
+		while k ~= nil do
+			count = count + 1
+			if count > 5000 then st.over = true break end
+			entries[count] = { k, val }
+			if type(k) == "number" and k >= 1 and k == math.floor(k) then
+				if k > maxIdx then maxIdx = k end
+			else
+				isArr = false
+			end
+			k, val = next(v, k)
+		end
+		if isArr and maxIdx ~= count then isArr = false end
+		local out = {}
+		if isArr and count > 0 then
+			table.sort(entries, function(a, b) return a[1] < b[1] end)
+			for i = 1, count do
+				st.n = st.n + 1
+				out[i] = snapshot(entries[i][2], st, depth + 1)
+			end
+			Json.arr(out)
+		else
+			for i = 1, count do
+				local ek = entries[i][1]
+				local key
+				if type(ek) == "string" then key = ek
+				elseif type(ek) == "number" or type(ek) == "boolean" then key = tostring(ek)
+				else key = "<" .. typeof(ek) .. ">" .. i end
+				st.n = st.n + 1
+				local lk = key:lower()
+				if lk:find("userid", 1, true) or lk:find("username", 1, true) then
+					out[key] = "<removed>"
+				else
+					out[key] = snapshot(entries[i][2], st, depth + 1)
+				end
+			end
+		end
+		st.stack[v] = nil
+		return out
+	elseif tv == "function" then
+		st.functions = st.functions + 1
+		return "<function>"
+	elseif tv == "thread" then
+		return "<thread>"
+	end
+	return plain(v)
+end
+
+function ModuleReader._run()
+	local targets = moduleTargets()
+	if #targets == 0 then
+		Log.warn("Nenhum m\u{F3}dulo da lista encontrado em ReplicatedStorage (Shared/Modules/Controllers).")
+		return
+	end
+	local stamp = os.date("!%Y%m%d_%H%M%S")
+	local dir = FSapi.ensureDir(CONFIG.EXPORT_DIR)
+	local sub = FSapi.ensureDir(CONFIG.EXPORT_DIR .. "/modules_" .. stamp)
+	if sub ~= "" then dir = sub end
+	local index = { kind = "module_data_dump", created = Util.iso(), place_id = tostring(game.PlaceId), modules = {},
+		rules = "read-only: tables only, no game function called, no remote touched" }
+	for _, t in ipairs(targets) do
+		local row = { module = t.name, path = path(t.inst), kind = t.kind }
+		local ok, res = safeRequire(t.inst)
+		if not ok then
+			row.error = tostring(res)
+			Log.warn(t.name .. ": " .. tostring(res))
+		else
+			local root = res
+			if t.field and type(res) == "table" then
+				local okf, v = pcall(function() return rawget(res, t.field) end)
+				root = okf and v or nil
+			end
+			if type(root) ~= "table" then
+				row.note = "module did not return a readable table (type " .. typeof(root) .. ")"
+				Log.warn(t.name .. ": " .. row.note)
+			else
+				local st = { n = 0, functions = 0, over = false, stack = {} }
+				local okS, snap = pcall(snapshot, root, st, 0)
+				if not okS then
+					row.error = tostring(snap)
+					Log.warn(t.name .. ": " .. tostring(snap))
+				else
+					row.entries, row.functions_listed_not_called, row.truncated = st.n, st.functions, st.over
+					local data = Json.encode({ module = t.name, path = row.path, kind = t.kind, entries = st.n, functions_not_called = st.functions, truncated = st.over, data = snap })
+					local okW, status = FSapi.write(dir .. t.name .. ".json", data)
+					row.file, row.chars, row.write = t.name .. ".json", #data, okW and status or ("FAILED: " .. tostring(status))
+					Log.info(string.format("%s: %d entradas, %d fun\u{E7}\u{F5}es (n\u{E3}o chamadas)%s -> %s", t.name, st.n, st.functions, st.over and ", TRUNCADO" or "", okW and "gravado" or "falha ao gravar"))
+				end
+			end
+		end
+		index.modules[#index.modules + 1] = row
+		task.wait()
+	end
+	FSapi.write(dir .. "_index.json", Json.encode(index))
+	Log.info("M\u{F3}dulos de dados: conclu\u{ED}do. Pasta: " .. dir)
+end
+
+function ModuleReader.run()
+	if ModuleReader.busy then
+		Log.warn("Leitura de m\u{F3}dulos j\u{E1} em andamento.")
+		return
+	end
+	if type(writefile) ~= "function" then
+		Log.err("LER M\u{D3}DULOS precisa de writefile, indispon\u{ED}vel neste executor.")
+		return
+	end
+	ModuleReader.busy = true
+	local ok, err = pcall(ModuleReader._run)
+	ModuleReader.busy = false
+	if not ok then Log.err("Leitura de m\u{F3}dulos falhou: " .. tostring(err)) end
+end
+
+function Control.readModules()
+	task.spawn(ModuleReader.run)
+end
+
 function Control.start()
 	if Session.state ~= "idle" then
 		Log.warn("Coleta j\u{E1} iniciada (estado: " .. Session.state .. ").")
@@ -3141,7 +3311,8 @@ function GUI.build()
 	mkBtn("EXPORTAR JSON", 8, 36, 132, body, Control.export)
 	mkBtn("ATUALIZAR INVENT\u{C1}RIO", 149, 36, 132, body, Control.refreshInventory)
 	mkBtn("LIMPAR DADOS", 290, 36, 132, body, Control.clear)
-	mkBtn("SALVAR TUDO (\u{C1}RVORE COMPLETA EM JSON)", 8, 66, 414, body, Control.saveAll)
+	mkBtn("SALVAR TUDO (\u{C1}RVORE)", 8, 66, 204, body, Control.saveAll)
+	mkBtn("LER M\u{D3}DULOS DE DADOS", 218, 66, 204, body, Control.readModules)
 
 	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 98), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
 	local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(80, 180, 120), BorderSizePixel = 0 }, barBg)
