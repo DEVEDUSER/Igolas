@@ -1146,10 +1146,9 @@ function Watch.onText(inst, rec)
 	-- texts (item name, price, stats) with the change so each stats text can be paired with its item.
 	local extra
 	if tt:find("%d") and hit(ancestorTokens(inst, 5), DETAIL_KW) then
+		-- the item name/price labels are siblings of the stats label: its parent is the right container
 		local panel = inst
-		for _ = 1, 3 do
-			if panel.Parent and panel.Parent ~= PlayerGui then panel = panel.Parent end
-		end
+		if panel.Parent and panel.Parent ~= PlayerGui then panel = panel.Parent end
 		extra = { panel_texts = L(collectTexts(panel, 14)), maxPerKey = 400, minInterval = 0.3 }
 	end
 	Events.push("text_changed", inst, rec, "Text", old, tt, extra)
@@ -3305,8 +3304,8 @@ function Control.clear()
 	Log.info("Dados limpos. Pressione INICIAR COLETA para recome\u{E7}ar.")
 end
 
-local TABS = {
-	{ "Buscar", "search" }, { "Console", "console" }, { "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
+local TABS = { -- data views of the COLETA page
+	{ "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
 	{ "Pets", "pets" }, { "Ovos", "eggs" }, { "Economia", "economy" }, { "Progress\u{E3}o", "progression" },
 	{ "Invent\u{E1}rio", "inventory" }, { "Interface", "ui" }, { "Eventos", "observed_events" },
 }
@@ -3352,21 +3351,24 @@ function GUI.render()
 		g.fill.Size = UDim2.new(math.min(Dump.nodes / math.max(Dump.total, 1), 0.99), 0, 1, 0)
 		g.progress.Text = string.format("salvando \u{E1}rvore: %d/~%d n\u{F3}s, %d arquivo(s)", Dump.nodes, Dump.total, Dump.files)
 	end
-	g.stats.Text = string.format("Objetos registrados: %d | Categorias preenchidas: %d/%d | Eventos: %d | Watchers: %d", total, filled, #DATA_CATS,
+	g.stats.Text = string.format("Registros: %d | Categorias: %d/%d | Eventos: %d | Watchers: %d", total, filled, #DATA_CATS,
 		#Store.lists.observed_events, Watch.count)
-	if GUI.tab == "search" then return end
-	local lines = {}
-	if GUI.tab == "console" then
-		local from = math.max(1, #Log.lines - 80)
-		for i = from, #Log.lines do lines[#lines + 1] = Log.lines[i] end
-	else
+	if GUI.page == "coleta" then
 		local list = Store.lists[GUI.tab]
-		lines[1] = string.format("%d registros (mostrando os %d mais recentes)", #list, math.min(#list, 70))
-		for i = #list, math.max(1, #list - 69), -1 do lines[#lines + 1] = GUI.lineFor(GUI.tab, list[i]) end
+		if list then
+			local lines = { string.format("%d registros (mostrando os %d mais recentes)", #list, math.min(#list, 70)) }
+			for i = #list, math.max(1, #list - 69), -1 do lines[#lines + 1] = GUI.lineFor(GUI.tab, list[i]) end
+			local text = table.concat(lines, "\n")
+			if #text > 15000 then text = text:sub(1, 15000) end
+			g.bodyData.Text = text
+		end
+	elseif GUI.page == "log" then
+		local lines = {}
+		for i = math.max(1, #Log.lines - 80), #Log.lines do lines[#lines + 1] = Log.lines[i] end
+		local text = table.concat(lines, "\n")
+		if #text > 15000 then text = text:sub(1, 15000) end
+		g.bodyLog.Text = text
 	end
-	local text = table.concat(lines, "\n")
-	if #text > 15000 then text = text:sub(1, 15000) end
-	g.body.Text = text
 end
 
 function GUI.build()
@@ -3395,8 +3397,9 @@ function GUI.build()
 		return i
 	end
 	local BG, PANEL, ACC = Color3.fromRGB(24, 26, 33), Color3.fromRGB(36, 39, 50), Color3.fromRGB(70, 110, 200)
+	local W, H = 430, 440
 
-	local main = mk("Frame", { Size = UDim2.fromOffset(430, 430), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = BG, BorderSizePixel = 0 }, sg)
+	local main = mk("Frame", { Size = UDim2.fromOffset(W, H), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = BG, BorderSizePixel = 0 }, sg)
 	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
 	local title = mk("TextLabel", { Size = UDim2.new(1, -60, 0, 28), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "  Unboxing Reference Collector v" .. CONFIG.VERSION,
 		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, main)
@@ -3411,59 +3414,84 @@ function GUI.build()
 		end)
 		return b
 	end
-	local min = mkBtn("-", 370, 1, 28, main, function() body.Visible = not body.Visible; main.Size = body.Visible and UDim2.fromOffset(430, 430) or UDim2.fromOffset(430, 28) end)
-	local close = mkBtn("X", 400, 1, 28, main, function() ENV.UBRC_INSTANCE.Destroy() end)
+	-- three equal columns inside a page; `fromBottom` anchors the row to the bottom edge
+	local function col(btn, i, y, h, fromBottom)
+		btn.Position = UDim2.new((i - 1) / 3, 4, fromBottom and 1 or 0, y)
+		btn.Size = UDim2.new(1 / 3, -8, 0, h or 26)
+	end
+
+	local min = mkBtn("-", 0, 1, 28, main, function() body.Visible = not body.Visible; main.Size = body.Visible and UDim2.fromOffset(W, H) or UDim2.fromOffset(W, 28) end)
+	local close = mkBtn("X", 0, 1, 28, main, function() ENV.UBRC_INSTANCE.Destroy() end)
 	min.Position = UDim2.new(1, -60, 0, 1); close.Position = UDim2.new(1, -30, 0, 1)
-	min.Size = UDim2.fromOffset(28, 26); close.Size = UDim2.fromOffset(28, 26)
-	min.Parent = main; close.Parent = main
 
-	mkBtn("INICIAR COLETA", 8, 6, 132, body, Control.start)
-	mkBtn("PAUSAR", 149, 6, 132, body, Control.pause)
-	mkBtn("RETOMAR", 290, 6, 132, body, Control.resume)
-	mkBtn("EXPORTAR JSON", 8, 36, 132, body, Control.export)
-	mkBtn("ATUALIZAR INVENT\u{C1}RIO", 149, 36, 132, body, Control.refreshInventory)
-	mkBtn("LIMPAR DADOS", 290, 36, 132, body, Control.clear)
-	mkBtn("SALVAR TUDO (\u{C1}RVORE)", 8, 66, 132, body, Control.saveAll)
-	mkBtn("LER M\u{D3}DULOS", 149, 66, 132, body, Control.readModules)
-	mkBtn("LER ITENS (Items/*)", 290, 66, 132, body, Control.readItems)
-
-	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 98), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
+	-- footer (always visible): progress + counters
+	local barBg = mk("Frame", { Position = UDim2.new(0, 8, 1, -46), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
 	local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(80, 180, 120), BorderSizePixel = 0 }, barBg)
 	local progress = mk("TextLabel", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "ocioso", TextColor3 = Color3.new(1, 1, 1),
 		Font = Enum.Font.Gotham, TextSize = 11, ZIndex = 2 }, barBg)
-	local stats = mk("TextLabel", { Position = UDim2.fromOffset(8, 118), Size = UDim2.new(1, -16, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(200, 205, 220),
+	local stats = mk("TextLabel", { Position = UDim2.new(0, 8, 1, -28), Size = UDim2.new(1, -16, 0, 26), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(200, 205, 220),
 		Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, body)
 
-	local tabBar = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 148), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1, BorderSizePixel = 0,
-		ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.X, ScrollingDirection = Enum.ScrollingDirection.X }, body)
-	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabBar)
+	-- pages
+	local host = mk("Frame", { Position = UDim2.fromOffset(0, 36), Size = UDim2.new(1, 0, 1, -86), BackgroundTransparency = 1 }, body)
+	local pages, modeBtns = {}, {}
+	for _, name in ipairs({ "save", "shop", "coleta", "log" }) do
+		pages[name] = mk("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Visible = false }, host)
+	end
+	local function setPage(name)
+		GUI.page = name
+		for k, f in pairs(pages) do f.Visible = (k == name) end
+		for k, b in pairs(modeBtns) do b.BackgroundColor3 = (k == name) and ACC or PANEL end
+		GUI.render()
+	end
+	for i, m in ipairs({ { "SALVAR", "save" }, { "LOJA (dano)", "shop" }, { "COLETA", "coleta" }, { "LOG", "log" } }) do
+		local b = mkBtn(m[1], 6 + (i - 1) * 105, 4, 100, body, function() setPage(m[2]) end)
+		modeBtns[m[2]] = b
+	end
 
-	local scroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 182), Size = UDim2.new(1, -16, 1, -190), BackgroundColor3 = PANEL, BorderSizePixel = 0,
-		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, body)
-	local text = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
-		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, scroll)
-
-	-- search pane (tab "Buscar"): type a name, tap a result to save that object's subtree as JSON
-	local pane = mk("Frame", { Position = scroll.Position, Size = scroll.Size, BackgroundColor3 = PANEL, BorderSizePixel = 0, Visible = true }, body)
-	local qbox = mk("TextBox", { Position = UDim2.fromOffset(4, 4), Size = UDim2.new(1, -100, 0, 28), BackgroundColor3 = BG, BorderSizePixel = 0,
-		TextColor3 = Color3.new(1, 1, 1), PlaceholderText = "nome do objeto (ex: Weapons, World1, Egg)", PlaceholderColor3 = Color3.fromRGB(140, 145, 160),
-		Text = "", ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left }, pane)
-	local goBtn = mkBtn("BUSCAR", 0, 4, 90, pane, function() Search.run(qbox.Text) end)
-	local autoBtn = mkBtn("BUSCAR+SALVAR", 4, 36, 130, pane, function() Search.run(qbox.Text, true) end)
-	autoBtn.Size = UDim2.new(1 / 3, -4, 0, 26)
-	local saveAllBtn = mkBtn("SALVAR LISTA", 0, 36, 130, pane, Control.saveResults)
-	saveAllBtn.Position = UDim2.new(1 / 3, 1, 0, 36)
-	saveAllBtn.Size = UDim2.new(1 / 3, -4, 0, 26)
-	local uniBtn = mkBtn("UNIVERSAL SEARCH", 0, 36, 130, pane, function() Search.universal() end)
-	uniBtn.Position = UDim2.new(2 / 3, 1, 0, 36)
-	uniBtn.Size = UDim2.new(1 / 3, -4, 0, 26)
-	goBtn.Position = UDim2.new(1, -94, 0, 4)
-	local resultList = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 68), Size = UDim2.new(1, -8, 1, -72), BackgroundTransparency = 1, BorderSizePixel = 0,
-		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, pane)
+	-- PAGE 1: SALVAR (search + save)
+	local ps = pages.save
+	local qbox = mk("TextBox", { Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -106, 0, 28), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+		TextColor3 = Color3.new(1, 1, 1), PlaceholderText = "nome do objeto (ex: World1, Weapons, Egg)", PlaceholderColor3 = Color3.fromRGB(140, 145, 160),
+		Text = "", ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left }, ps)
+	local goBtn = mkBtn("BUSCAR", 0, 0, 90, ps, function() Search.run(qbox.Text) end)
+	goBtn.Position = UDim2.new(1, -98, 0, 0); goBtn.Size = UDim2.new(0, 94, 0, 28)
+	col(mkBtn("BUSCAR+SALVAR", 0, 0, 100, ps, function() Search.run(qbox.Text, true) end), 1, 32)
+	local saveAllBtn = mkBtn("SALVAR LISTA", 0, 0, 100, ps, Control.saveResults)
+	col(saveAllBtn, 2, 32)
+	col(mkBtn("UNIVERSAL SEARCH", 0, 0, 100, ps, function() Search.universal() end), 3, 32)
+	local resultList = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 64), Size = UDim2.new(1, -8, 1, -102), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, ps)
 	mk("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, resultList)
+	col(mkBtn("SALVAR TUDO (\u{C1}RVORE)", 0, 0, 100, ps, Control.saveAll), 1, -30, 26, true)
+	col(mkBtn("LER M\u{D3}DULOS", 0, 0, 100, ps, Control.readModules), 2, -30, 26, true)
+	col(mkBtn("LER ITENS (Items/*)", 0, 0, 100, ps, Control.readItems), 3, -30, 26, true)
 
-	scroll.Visible = false
-	GUI.tab = "search"
+	-- PAGE 2: LOJA (guided capture of weapon damage / speed texts)
+	local pl = pages.shop
+	mk("TextLabel", { Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -8, 0, 214), BackgroundColor3 = PANEL, BorderSizePixel = 0, TextColor3 = Color3.fromRGB(215, 220, 235),
+		Font = Enum.Font.Gotham, TextSize = 12, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false,
+		Text = "  CAPTURAR DANO DAS ARMAS (loja)\n\n  1) Toque em INICIAR COLETA e espere o LOG dizer 'Escaneamento inicial conclu\u{ED}do'.\n\n  2) Abra a loja de armas do jogo e toque em cada arma, devagar (1 s entre toques). O coletor guarda o nome, o pre\u{E7}o e o texto 'x? Damage x? Speed Streak' de cada uma.\n\n  3) No fim de cada mundo, toque em EXPORTAR JSON. N\u{E3}o toque em LIMPAR antes de exportar.\n\n  4) Mande a pasta UnboxingReferenceCollector." }, pl)
+	col(mkBtn("INICIAR COLETA", 0, 0, 100, pl, Control.start), 1, 222, 34)
+	col(mkBtn("EXPORTAR JSON", 0, 0, 100, pl, Control.export), 2, 222, 34)
+	col(mkBtn("LIMPAR DADOS", 0, 0, 100, pl, Control.clear), 3, 222, 34)
+
+	-- PAGE 3: COLETA (the original collector: controls + data views)
+	local pc = pages.coleta
+	col(mkBtn("INICIAR COLETA", 0, 0, 100, pc, Control.start), 1, 0)
+	col(mkBtn("PAUSAR", 0, 0, 100, pc, Control.pause), 2, 0)
+	col(mkBtn("RETOMAR", 0, 0, 100, pc, Control.resume), 3, 0)
+	col(mkBtn("EXPORTAR JSON", 0, 0, 100, pc, Control.export), 1, 30)
+	col(mkBtn("ATUALIZAR INVENT\u{C1}RIO", 0, 0, 100, pc, Control.refreshInventory), 2, 30)
+	col(mkBtn("LIMPAR DADOS", 0, 0, 100, pc, Control.clear), 3, 30)
+	local tabBar = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 62), Size = UDim2.new(1, -8, 0, 30), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.X, ScrollingDirection = Enum.ScrollingDirection.X }, pc)
+	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabBar)
+	local dataScroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 96), Size = UDim2.new(1, -8, 1, -100), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, pc)
+	local bodyData = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
+		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, dataScroll)
+	GUI.tab = "objects"
 	local tabButtons = {}
 	for _, t in ipairs(TABS) do
 		local b = mk("TextButton", { Size = UDim2.fromOffset(#t[1] * 7 + 18, 26), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = t[1], TextColor3 = Color3.new(1, 1, 1),
@@ -3473,12 +3501,16 @@ function GUI.build()
 		Session.guiConns[#Session.guiConns + 1] = b.MouseButton1Click:Connect(function()
 			GUI.tab = t[2]
 			for k, btn in pairs(tabButtons) do btn.BackgroundColor3 = (k == GUI.tab) and ACC or PANEL end
-			scroll.Visible = GUI.tab ~= "search"
-			pane.Visible = GUI.tab == "search"
 			GUI.render()
 		end)
 	end
-	tabButtons.search.BackgroundColor3 = ACC
+	tabButtons.objects.BackgroundColor3 = ACC
+
+	-- PAGE 4: LOG
+	local logScroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -8, 1, -4), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, pages.log)
+	local bodyLog = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
+		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, logScroll)
 
 	-- dragging (mouse + touch)
 	local dragging, dragStart, startPos
@@ -3497,7 +3529,8 @@ function GUI.build()
 		end
 	end)
 
-	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats, list = resultList, saveAll = saveAllBtn }
+	GUI.refs = { gui = sg, main = main, fill = fill, progress = progress, stats = stats, bodyData = bodyData, bodyLog = bodyLog, list = resultList, saveAll = saveAllBtn }
+	setPage("save")
 end
 
 function GUI.showResults(res, nested)
