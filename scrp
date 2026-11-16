@@ -57,7 +57,7 @@ local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:
 -- 1. CONFIG
 ------------------------------------------------------------------------------------------------------
 local CONFIG = {
-	VERSION = "1.0",
+	VERSION = "1.1",
 	FRAME_BUDGET = 0.006,          -- seconds of scan work per slice before yielding
 	MAX_RECORDS = {                -- hard memory caps per category (rejections are counted and exported)
 		objects = 12000, ui = 12000, worlds = 1500, boxes = 1500, weapons = 1500, pets = 2000,
@@ -2654,9 +2654,14 @@ function Dump.excluded(inst)
 	return false
 end
 
-function Dump._run(rootsOverride, label)
+function Dump._run(rootsOverride, label, useFolder)
 	local stamp = os.date("!%Y%m%d_%H%M%S")
-	local base = FSapi.ensureDir(CONFIG.EXPORT_DIR) .. "ubrc_" .. (label and ("save_" .. label) or "fulltree") .. "_" .. stamp
+	local dirPrefix = FSapi.ensureDir(CONFIG.EXPORT_DIR)
+	if useFolder and label and dirPrefix ~= "" then
+		local sub = FSapi.ensureDir(CONFIG.EXPORT_DIR .. "/" .. label .. "_" .. stamp)
+		if sub ~= "" then dirPrefix = sub end
+	end
+	local base = dirPrefix .. "ubrc_" .. (label and ("save_" .. label) or "fulltree") .. "_" .. stamp
 	local roots = rootsOverride or Roots.list()
 	if not rootsOverride then
 		for _, name in ipairs({ "StarterGui", "StarterPlayer", "SoundService", "MaterialService" }) do
@@ -2769,7 +2774,7 @@ function Dump._run(rootsOverride, label)
 	if truncated then Log.warn("Limite de " .. CONFIG.DUMP_MAX_NODES .. " nos atingido; o restante nao foi salvo.") end
 end
 
-function Dump.run(rootsOverride, label)
+function Dump.run(rootsOverride, label, useFolder)
 	if Dump.busy then
 		Log.warn("Salvar tudo j\u{E1} em andamento.")
 		return
@@ -2779,7 +2784,7 @@ function Dump.run(rootsOverride, label)
 		return
 	end
 	Dump.busy = true
-	local ok, err = pcall(Dump._run, rootsOverride, label)
+	local ok, err = pcall(Dump._run, rootsOverride, label, useFolder)
 	Dump.busy = false
 	if not ok then Log.err("Salvar falhou: " .. tostring(err)) end
 end
@@ -2790,7 +2795,10 @@ end
 
 -- Search by name (descendants of the readable roots) -> click a result -> its subtree is saved as JSON.
 local Search = { busy = false }
-function Search.run(query)
+-- Matches by name (or by full path when the query contains a dot). Results nested inside another result are
+-- folded into it, because saving the parent already saves everything below it.
+local SEARCH_LIMIT = 3000   -- collected (and saved); the list below shows the first 200
+function Search.run(query, autoSave)
 	query = tostring(query or ""):lower()
 	if #query < 2 then
 		Log.warn("Digite ao menos 2 letras para buscar.")
@@ -2798,20 +2806,35 @@ function Search.run(query)
 	end
 	if Search.busy then return end
 	Search.busy = true
+	Search.lastQuery = query
 	task.spawn(function()
-		local res, t0 = {}, clock()
+		local res, matched, nested, t0 = {}, setmetatable({}, { __mode = "k" }), 0, clock()
+		local useFull = query:find(".", 1, true) ~= nil
 		local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
 		local rootsList = { Workspace, ReplicatedStorage, svc("ReplicatedFirst"), svc("StarterGui"), svc("StarterPack"), Lighting, PlayerGui, bp }
 		for _, root in ipairs(rootsList) do
-			if root and #res < 60 then
+			if root and #res < SEARCH_LIMIT then
 				local ok, desc = pcall(root.GetDescendants, root)
 				if ok then
 					for _, d in ipairs(desc) do
-						if #res >= 60 then break end
-						if d.Name:lower():find(query, 1, true) then
+						if #res >= SEARCH_LIMIT then break end
+						local hitName
+						if useFull then hitName = path(d):lower():find(query, 1, true) ~= nil else hitName = d.Name:lower():find(query, 1, true) ~= nil end
+						if hitName then
 							local own = Session.ownGui
 							if not (own and (d == own or d:IsDescendantOf(own))) and not Dump.excluded(d) and not insideExcluded(d) then
-								res[#res + 1] = d
+								local cur, covered = d.Parent, false
+								for _ = 1, 40 do
+									if not cur then break end
+									if matched[cur] then covered = true break end
+									cur = cur.Parent
+								end
+								if covered then
+									nested = nested + 1
+								else
+									matched[d] = true
+									res[#res + 1] = d
+								end
 							end
 						end
 						if clock() - t0 > CONFIG.FRAME_BUDGET then
@@ -2823,9 +2846,26 @@ function Search.run(query)
 			end
 		end
 		Search.busy = false
-		Log.info(string.format("Busca '%s': %d resultado(s)%s.", query, #res, #res >= 60 and " (limite de 60)" or ""))
-		if GUI.showResults then GUI.showResults(res) end
+		Search.last = res
+		Log.info(string.format("Busca '%s': %d resultado(s) principais (+%d dentro deles)%s.", query, #res, nested, #res >= SEARCH_LIMIT and " - limite atingido" or ""))
+		if GUI.showResults then GUI.showResults(res, nested) end
+		if autoSave then Control.saveResults() end
 	end)
+end
+
+function Control.saveResults()
+	local res = Search.last
+	if not res or #res == 0 then
+		Log.warn("Nenhum resultado para salvar. Fa\u{E7}a uma busca primeiro.")
+		return
+	end
+	local roots = {}
+	for _, inst in ipairs(res) do
+		if inst.Parent then roots[#roots + 1] = { label = inst.Name, inst = inst, tag = Roots.tagOf(inst) } end
+	end
+	local label = tostring(Search.lastQuery or "busca"):gsub("[^%w_%-]", "_"):sub(1, 30)
+	Log.info("Salvando " .. #roots .. " resultado(s) da busca '" .. tostring(Search.lastQuery) .. "'...")
+	task.spawn(Dump.run, roots, label, true) -- true = everything goes into one folder named after the search
 end
 
 function Control.saveInstance(inst)
@@ -2905,10 +2945,9 @@ function Control.clear()
 end
 
 local TABS = {
-	{ "Console", "console" }, { "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
+	{ "Buscar", "search" }, { "Console", "console" }, { "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
 	{ "Pets", "pets" }, { "Ovos", "eggs" }, { "Economia", "economy" }, { "Progress\u{E3}o", "progression" },
 	{ "Invent\u{E1}rio", "inventory" }, { "Interface", "ui" }, { "Eventos", "observed_events" },
-	{ "Buscar", "search" },
 }
 local SUMMARY_KEYS = {
 	boxes = { "health_current", "health_max", "world_kind" }, weapons = { "damage", "rarity", "attack_speed" }, pets = { "rarity", "category" },
@@ -3042,17 +3081,23 @@ function GUI.build()
 		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, scroll)
 
 	-- search pane (tab "Buscar"): type a name, tap a result to save that object's subtree as JSON
-	local pane = mk("Frame", { Position = scroll.Position, Size = scroll.Size, BackgroundColor3 = PANEL, BorderSizePixel = 0, Visible = false }, body)
+	local pane = mk("Frame", { Position = scroll.Position, Size = scroll.Size, BackgroundColor3 = PANEL, BorderSizePixel = 0, Visible = true }, body)
 	local qbox = mk("TextBox", { Position = UDim2.fromOffset(4, 4), Size = UDim2.new(1, -100, 0, 28), BackgroundColor3 = BG, BorderSizePixel = 0,
 		TextColor3 = Color3.new(1, 1, 1), PlaceholderText = "nome do objeto (ex: Weapons, World1, Egg)", PlaceholderColor3 = Color3.fromRGB(140, 145, 160),
 		Text = "", ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left }, pane)
 	local goBtn = mkBtn("BUSCAR", 0, 4, 90, pane, function() Search.run(qbox.Text) end)
+	local autoBtn = mkBtn("BUSCAR E SALVAR TUDO", 4, 36, 190, pane, function() Search.run(qbox.Text, true) end)
+	autoBtn.Size = UDim2.new(0.5, -6, 0, 26)
+	local saveAllBtn = mkBtn("SALVAR RESULTADOS", 0, 36, 190, pane, Control.saveResults)
+	saveAllBtn.Position = UDim2.new(0.5, 2, 0, 36)
+	saveAllBtn.Size = UDim2.new(0.5, -6, 0, 26)
 	goBtn.Position = UDim2.new(1, -94, 0, 4)
-	local resultList = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 38), Size = UDim2.new(1, -8, 1, -42), BackgroundTransparency = 1, BorderSizePixel = 0,
+	local resultList = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 68), Size = UDim2.new(1, -8, 1, -72), BackgroundTransparency = 1, BorderSizePixel = 0,
 		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, pane)
 	mk("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, resultList)
 
-	GUI.tab = "console"
+	scroll.Visible = false
+	GUI.tab = "search"
 	local tabButtons = {}
 	for _, t in ipairs(TABS) do
 		local b = mk("TextButton", { Size = UDim2.fromOffset(#t[1] * 7 + 18, 26), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = t[1], TextColor3 = Color3.new(1, 1, 1),
@@ -3067,7 +3112,7 @@ function GUI.build()
 			GUI.render()
 		end)
 	end
-	tabButtons.console.BackgroundColor3 = ACC
+	tabButtons.search.BackgroundColor3 = ACC
 
 	-- dragging (mouse + touch)
 	local dragging, dragStart, startPos
@@ -3086,16 +3131,18 @@ function GUI.build()
 		end
 	end)
 
-	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats, list = resultList }
+	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats, list = resultList, saveAll = saveAllBtn }
 end
 
-function GUI.showResults(res)
+function GUI.showResults(res, nested)
 	local g = GUI.refs
 	if not g or not g.list then return end
+	g.saveAll.Text = string.format("SALVAR RESULTADOS (%d)", #res)
 	for _, c in ipairs(g.list:GetChildren()) do
 		if c:IsA("TextButton") then c:Destroy() end
 	end
 	for i, inst in ipairs(res) do
+		if i > 200 then break end -- the list shows 200; SALVAR saves all of them
 		local row = Instance.new("TextButton")
 		row.Size = UDim2.new(1, -8, 0, 36)
 		row.LayoutOrder = i
