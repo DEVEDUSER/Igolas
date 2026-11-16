@@ -2651,6 +2651,15 @@ function Dump.excluded(inst)
 	local cls = inst.ClassName
 	if cls == "Model" and Players:GetPlayerFromCharacter(inst) then return true end
 	if (cls == "Folder" or cls == "Model") and OtherPlayers[inst.Name] then return true end
+	if inst.Name == "Highscores" then return true end -- leaderboards hold other players' names/ids
+	return false
+end
+
+-- ignore an identical save requested again within a few seconds (double taps)
+function Dump.repeated(key)
+	local t = clock()
+	if Dump.lastKey == key and t - (Dump.lastT or 0) < 15 then return true end
+	Dump.lastKey, Dump.lastT = key, t
 	return false
 end
 
@@ -2705,6 +2714,10 @@ function Dump._run(rootsOverride, label, useFolder)
 		local cls = inst.ClassName
 		local node = { i = n, p = pid, n = trunc(inst.Name), c = cls }
 		local a = Util.attrs(inst)
+		for k in pairs(a) do
+			local lk = k:lower()
+			if lk:find("userid", 1, true) or lk:find("username", 1, true) or lk:find("ownerid", 1, true) then a[k] = nil end
+		end
 		if next(a) ~= nil then node.a = a end
 		local tg = Util.tags(inst)
 		if #tg > 0 then node.t = tg end
@@ -2859,6 +2872,10 @@ function Control.saveResults()
 		Log.warn("Nenhum resultado para salvar. Fa\u{E7}a uma busca primeiro.")
 		return
 	end
+	if Dump.repeated("search:" .. tostring(Search.lastQuery)) then
+		Log.warn("Essa busca j\u{E1} foi salva h\u{E1} instantes; ignorado para n\u{E3}o duplicar a pasta.")
+		return
+	end
 	local roots = {}
 	for _, inst in ipairs(res) do
 		if inst.Parent then roots[#roots + 1] = { label = inst.Name, inst = inst, tag = Roots.tagOf(inst) } end
@@ -2871,6 +2888,10 @@ end
 function Control.saveInstance(inst)
 	if not inst or not inst.Parent then
 		Log.warn("Objeto n\u{E3}o existe mais.")
+		return
+	end
+	if Dump.repeated("inst:" .. path(inst)) then
+		Log.warn("Esse objeto j\u{E1} foi salvo h\u{E1} instantes; ignorado.")
 		return
 	end
 	local label = tostring(inst.Name):gsub("[^%w_%-]", "_"):sub(1, 30)
