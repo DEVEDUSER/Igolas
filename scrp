@@ -1,1532 +1,2736 @@
-local Rayfield
+--[[
+	Unboxing Reference Collector  v1.0
+	Read-only, client-side inspection tool (Luau, written for the Delta executor).
+
+	WHAT IT DOES
+	  * Walks the parts of the DataModel the client can legitimately see and records what it observes.
+	  * Watches the session with events (DescendantAdded/Removing, AttributeChanged, Changed, Text changes).
+	  * Exports everything as JSON (file via writefile when available, console fallback otherwise).
+
+	WHAT IT NEVER DOES
+	  * Never writes to any game Instance (no property sets, no :Destroy, no :Clone, no reparenting).
+	  * Never fires/invokes RemoteEvents or RemoteFunctions (they are only listed by name/class).
+	  * Never reads script source, never uses getgc/getsenv/hookfunction/hookmetamethod/getrawmetatable.
+	  * Never uses HttpGet/request/loadstring or sends data anywhere. (One optional Roblox API call:
+	    MarketplaceService:GetProductInfo, used only to check the place name. Disable: CONFIG.FETCH_PLACE_NAME.)
+	  * Other players' characters and per-player folders are skipped on purpose.
+
+	Everything unknown is exported as "not_observed" (or null). Nothing is guessed.
+]]
+
+------------------------------------------------------------------------------------------------------
+-- 0. ENVIRONMENT / SINGLETON
+------------------------------------------------------------------------------------------------------
+local ENV = (type(getgenv) == "function" and getgenv()) or _G
+if type(ENV.UBRC_INSTANCE) == "table" and type(ENV.UBRC_INSTANCE.Destroy) == "function" then
+	pcall(ENV.UBRC_INSTANCE.Destroy) -- re-execution replaces the previous instance (no duplicate GUIs/connections)
+	ENV.UBRC_INSTANCE = nil
+end
+
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+local function svc(name)
+	local ok, s = pcall(game.GetService, game, name)
+	if ok then return s end
+	return nil
+end
+
+local Players = svc("Players")
+local Workspace = svc("Workspace")
+local ReplicatedStorage = svc("ReplicatedStorage")
+local Lighting = svc("Lighting")
+local CollectionService = svc("CollectionService")
+local HttpService = svc("HttpService")
+local UserInputService = svc("UserInputService")
+local MarketplaceService = svc("MarketplaceService")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+	task.wait(0.1)
+	LocalPlayer = Players.LocalPlayer
+end
+local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+
+------------------------------------------------------------------------------------------------------
+-- 1. CONFIG
+------------------------------------------------------------------------------------------------------
+local CONFIG = {
+	VERSION = "1.0",
+	FRAME_BUDGET = 0.006,          -- seconds of scan work per slice before yielding
+	MAX_RECORDS = {                -- hard memory caps per category (rejections are counted and exported)
+		objects = 12000, ui = 6000, worlds = 1500, boxes = 1500, weapons = 1500, pets = 2000,
+		eggs = 800, economy = 2500, progression = 1500, inventory = 3000, observed_events = 4000,
+	},
+	MAX_CHILDREN_PER_PARENT = 1500,
+	MAX_DEPTH = 60,
+	MAX_STRING = 240,
+	MAX_ATTRS = 60,
+	MAX_WATCHERS = 700,            -- cap on live event connections
+	MAX_QUEUE = 3000,              -- cap on pending DescendantAdded items
+	QUEUE_PER_STEP = 150,
+	EVENT_MIN_INTERVAL = 1.0,      -- per (event kind, instance, property) seconds
+	EVENT_MAX_PER_KEY = 40,
+	MAX_CONSOLE_LINES = 200,
+	EXPORT_DIR = "UnboxingReferenceCollector",
+	SINGLE_FILE_MAX_CHARS = 2400000,
+	PART_MAX_CHARS = 900000,
+	PRINT_CHUNK = 3000,
+	FETCH_PLACE_NAME = true,
+}
+
+local NO = "not_observed"
+local DATA_CATS = { "worlds", "boxes", "weapons", "pets", "eggs", "economy", "progression", "inventory", "ui", "objects", "observed_events" }
+local PREFIX = {
+	worlds = "world", boxes = "box", weapons = "weap", pets = "pet", eggs = "egg", economy = "eco",
+	progression = "prog", inventory = "inv", ui = "ui", objects = "obj", observed_events = "evt",
+}
+local CONF_RANK = { low = 1, medium = 2, high = 3 }
+
+-- forward declarations (filled below)
+local Util, Json, Log, Session, Store = {}, {}, {}, {}, {}
+local Tok, Ctx, Roots, Events, Watch, Queue = {}, {}, {}, {}, {}, {}
+local Items, Inventory, World, Monitor, Scanner, Visit = {}, {}, {}, {}, {}, {}
+local Boxes, Economy, Progression, Exporter, FSapi, GUI, Control = {}, {}, {}, {}, {}, {}, {}
+local Hooks = {}
+
+------------------------------------------------------------------------------------------------------
+-- 2. JSON ENCODER (own implementation: supports null, NaN/inf -> null, key order, fixed escaping)
+------------------------------------------------------------------------------------------------------
+local NULL = setmetatable({}, { __tostring = function() return "null" end })
+Json.NULL = NULL
+local ARR = setmetatable({}, { __mode = "k" })
+function Json.arr(t)
+	ARR[t] = true
+	return t
+end
+local L = Json.arr
+
+local ESC = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+local function escChar(c)
+	return ESC[c] or string.format("\\u%04x", string.byte(c))
+end
+
+local function encStr(s)
+	if utf8 and utf8.len and not utf8.len(s) then
+		s = s:gsub("[\128-\255]", "?")
+	end
+	local body = s:gsub('[%c"\\]', escChar)
+	return '"' .. body .. '"'
+end
+
+local function encNum(v)
+	if v ~= v or v == math.huge or v == -math.huge then return "null" end
+	if v == 0 then return "0" end
+	if v == math.floor(v) and math.abs(v) < 1e15 then
+		return string.format("%.0f", v)
+	end
+	return string.format("%.14g", v)
+end
+
+local function isArray(t)
+	if ARR[t] then return true end
+	local n = #t
+	if n == 0 then return false end
+	local c = 0
+	for _ in pairs(t) do c = c + 1 end
+	return c == n
+end
+
+local function enc(v, buf, depth, order)
+	local tv = type(v)
+	if v == nil or v == NULL then
+		buf[#buf + 1] = "null"
+	elseif tv == "string" then
+		buf[#buf + 1] = encStr(v)
+	elseif tv == "number" then
+		buf[#buf + 1] = encNum(v)
+	elseif tv == "boolean" then
+		buf[#buf + 1] = v and "true" or "false"
+	elseif tv == "table" then
+		if depth > 14 then
+			buf[#buf + 1] = '"<max_depth>"'
+			return
+		end
+		if isArray(v) then
+			buf[#buf + 1] = "["
+			for i = 1, #v do
+				if i > 1 then buf[#buf + 1] = "," end
+				enc(v[i], buf, depth + 1)
+			end
+			buf[#buf + 1] = "]"
+		else
+			local keys, seen = {}, {}
+			if order then
+				for _, k in ipairs(order) do
+					if v[k] ~= nil then keys[#keys + 1] = k; seen[k] = true end
+				end
+			end
+			local rest = {}
+			for k in pairs(v) do
+				if not (type(k) == "string" and seen[k]) then rest[#rest + 1] = k end
+			end
+			table.sort(rest, function(a, b) return tostring(a) < tostring(b) end)
+			for _, k in ipairs(rest) do keys[#keys + 1] = k end
+			buf[#buf + 1] = "{"
+			for i, k in ipairs(keys) do
+				if i > 1 then buf[#buf + 1] = "," end
+				buf[#buf + 1] = encStr(tostring(k))
+				buf[#buf + 1] = ":"
+				enc(v[k], buf, depth + 1)
+			end
+			buf[#buf + 1] = "}"
+		end
+	else
+		buf[#buf + 1] = "null" -- functions, threads, userdata are never exported
+	end
+end
+
+function Json.encode(v, order)
+	local buf = {}
+	enc(v, buf, 0, order)
+	return table.concat(buf)
+end
+
+local RECORD_ORDER = { "id", "name", "category", "properties", "source", "collected_at", "last_updated_at", "confidence" }
+function Json.encodeRecord(rec)
+	local parts = { "{" }
+	local first = true
+	for _, k in ipairs(RECORD_ORDER) do
+		local v = rec[k]
+		if v ~= nil then
+			if not first then parts[#parts + 1] = "," end
+			first = false
+			parts[#parts + 1] = encStr(k)
+			parts[#parts + 1] = ":"
+			parts[#parts + 1] = Json.encode(v)
+		end
+	end
+	parts[#parts + 1] = "}"
+	return table.concat(parts)
+end
+
+function Json.selfTest()
+	local sample = {
+		a = 1, b = 1.5, c = 0 / 0, d = math.huge, e = NULL, f = "x\"y\\z\n\t\1", g = L({}), h = {}, i = { 1, 2, { j = true } },
+		k = "caf\u{E9} \u{1F600}",
+	}
+	local s = Json.encode(sample, { "a" })
+	local ok, dec = pcall(function() return HttpService:JSONDecode(s) end)
+	if not ok then return false, "decode failed: " .. tostring(dec) .. " | " .. s end
+	if dec.a ~= 1 or dec.b ~= 1.5 or dec.c ~= nil or dec.d ~= nil or dec.f ~= "x\"y\\z\n\t\1" or #dec.g ~= 0 or dec.i[3].j ~= true or dec.k ~= "caf\u{E9} \u{1F600}" then
+		return false, "roundtrip mismatch: " .. s
+	end
+	return true, "ok"
+end
+
+------------------------------------------------------------------------------------------------------
+-- 3. UTIL
+------------------------------------------------------------------------------------------------------
+local floor, abs = math.floor, math.abs
+
+local function clock()
+	if type(tick) == "function" then return tick() end
+	return os.time()
+end
+Util.clock = clock
+
+function Util.iso(t)
+	return os.date("!%Y-%m-%dT%H:%M:%SZ", floor(t or os.time()))
+end
+
+function Util.set(list)
+	local s = {}
+	for _, v in ipairs(list) do s[v] = true end
+	return s
+end
+local set = Util.set
+
+local function hit(tok, kw)
+	for t in pairs(tok) do
+		if kw[t] then return t end
+	end
+	return nil
+end
+Util.hit = hit
+
+function Util.num(n)
+	if n ~= n or n == math.huge or n == -math.huge then return NULL end
+	return floor(n * 1000 + 0.5) / 1000
+end
+local function r2(n) return floor(n * 100 + 0.5) / 100 end
+
+function Util.trunc(s)
+	s = tostring(s)
+	if #s > CONFIG.MAX_STRING then
+		local cut = #s - CONFIG.MAX_STRING
+		s = s:sub(1, CONFIG.MAX_STRING)
+		s = s:gsub("[\192-\255][\128-\191]*$", "")
+		s = s .. "...[+" .. cut .. " bytes]"
+	end
+	return s
+end
+local trunc = Util.trunc
+
+local function rawGet(inst, prop) return inst[prop] end
+local function get(inst, prop)
+	local ok, v = pcall(rawGet, inst, prop)
+	if ok then return v end
+	return nil
+end
+Util.get = get
+
+function Util.path(inst)
+	local ok, p = pcall(inst.GetFullName, inst)
+	if ok then return trunc(p) end
+	return trunc(tostring(inst))
+end
+local path = Util.path
+
+local uidMap = setmetatable({}, { __mode = "k" })
+local uidN = 0
+function Util.uid(inst)
+	local u = uidMap[inst]
+	if not u then
+		uidN = uidN + 1
+		u = uidN
+		uidMap[inst] = u
+	end
+	return u
+end
+
+function Util.norm(s)
+	return (tostring(s):lower():gsub("[^%w]", ""))
+end
+
+local SUFFIX = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33 }
+function Util.parseNumber(s)
+	if type(s) ~= "string" then return nil end
+	local numstr, suf = s:match("(%d[%d,]*%.?%d*)%s*(%a*)")
+	if not numstr then return nil end
+	numstr = numstr:gsub(",", "")
+	local n = tonumber(numstr)
+	if not n then return nil end
+	local mult = SUFFIX[suf:lower()]
+	if mult then n = n * mult end
+	return n
+end
+local parseNumber = Util.parseNumber
+
+local function plain(v, depth)
+	depth = depth or 0
+	if v == nil or v == NULL then return NULL end
+	local t = typeof(v)
+	if t == "string" then return trunc(v)
+	elseif t == "number" then return Util.num(v)
+	elseif t == "boolean" then return v
+	elseif t == "Vector3" then return { x = Util.num(v.X), y = Util.num(v.Y), z = Util.num(v.Z) }
+	elseif t == "Vector2" then return { x = Util.num(v.X), y = Util.num(v.Y) }
+	elseif t == "CFrame" then
+		local out = { position = { x = Util.num(v.X), y = Util.num(v.Y), z = Util.num(v.Z) } }
+		local ok, rx, ry, rz = pcall(v.ToOrientation, v)
+		if ok then out.orientation_degrees = { x = Util.num(math.deg(rx)), y = Util.num(math.deg(ry)), z = Util.num(math.deg(rz)) } end
+		return out
+	elseif t == "Color3" then
+		local r, g, b = floor(v.R * 255 + 0.5), floor(v.G * 255 + 0.5), floor(v.B * 255 + 0.5)
+		return { r = r, g = g, b = b, hex = string.format("#%02X%02X%02X", r, g, b) }
+	elseif t == "UDim2" then
+		return { x = { scale = Util.num(v.X.Scale), offset = v.X.Offset }, y = { scale = Util.num(v.Y.Scale), offset = v.Y.Offset } }
+	elseif t == "UDim" then
+		return { scale = Util.num(v.Scale), offset = v.Offset }
+	elseif t == "BrickColor" then return v.Name
+	elseif t == "EnumItem" then return tostring(v)
+	elseif t == "Instance" then return path(v)
+	elseif t == "table" then
+		if depth >= 4 then return "<table>" end
+		local out, n = {}, 0
+		if #v > 0 then
+			for i = 1, #v do
+				if n >= 60 then break end
+				out[#out + 1] = plain(v[i], depth + 1)
+				n = n + 1
+			end
+			return L(out)
+		end
+		for k, x in pairs(v) do
+			if n >= 60 then break end
+			out[tostring(k)] = plain(x, depth + 1)
+			n = n + 1
+		end
+		return out
+	end
+	return trunc(tostring(v))
+end
+Util.plain = plain
+
+function Util.attrs(inst)
+	local ok, a = pcall(inst.GetAttributes, inst)
+	if not ok or type(a) ~= "table" then return {} end
+	local out, n = {}, 0
+	for k, v in pairs(a) do
+		if n >= CONFIG.MAX_ATTRS then break end
+		out[tostring(k)] = plain(v, 1)
+		n = n + 1
+	end
+	return out
+end
+
+function Util.tags(inst)
+	local ok, t = pcall(CollectionService.GetTags, CollectionService, inst)
+	local out = {}
+	if ok and type(t) == "table" then
+		for i, v in ipairs(t) do
+			if i > 20 then break end
+			out[#out + 1] = trunc(v)
+		end
+	end
+	return L(out)
+end
+
+-- Direct ValueBase children (and one level inside Configuration/Folder children).
+function Util.valueChildren(inst, depth)
+	depth = depth or 0
+	local out, n = {}, 0
+	local ok, ch = pcall(inst.GetChildren, inst)
+	if not ok then return out end
+	for _, c in ipairs(ch) do
+		if n >= 40 then break end
+		if c:IsA("ValueBase") then
+			local okv, val = pcall(rawGet, c, "Value")
+			if okv then
+				local key = c.Name
+				if out[key] ~= nil then key = key .. "#" .. n end
+				out[key] = plain(val, 1)
+				n = n + 1
+			end
+		elseif depth == 0 and (c:IsA("Configuration") or c:IsA("Folder")) then
+			local sub = Util.valueChildren(c, 1)
+			if next(sub) ~= nil then
+				out[c.Name] = sub
+				n = n + 1
+			end
+		end
+	end
+	return out
+end
+
+local NOISE = set({ "Attachment", "Weld", "WeldConstraint", "Motor6D", "ManualWeld", "Decal", "Texture", "SurfaceAppearance",
+	"ParticleEmitter", "Trail", "Beam", "PointLight", "SpotLight", "SurfaceLight", "Fire", "Smoke", "Sparkles", "Highlight",
+	"Animator", "UICorner", "UIStroke", "UIPadding", "UIListLayout", "UIGridLayout", "UIGradient", "UIAspectRatioConstraint",
+	"UIScale", "UISizeConstraint", "UITextSizeConstraint", "UIPageLayout", "UITableLayout" })
+
+------------------------------------------------------------------------------------------------------
+-- 4. LOG + SESSION
+------------------------------------------------------------------------------------------------------
+Log.lines = {}
+Log.once = {}
+Log.suppressed = 0
+function Log.add(level, msg)
+	local line = string.format("[%s][%s] %s", os.date("%H:%M:%S"), level, tostring(msg))
+	Log.lines[#Log.lines + 1] = line
+	if #Log.lines > CONFIG.MAX_CONSOLE_LINES then table.remove(Log.lines, 1) end
+	if level == "ERR" or level == "WARN" then warn("[UBRC] " .. tostring(msg)) else print("[UBRC] " .. tostring(msg)) end
+end
+function Log.info(m) Log.add("INFO", m) end
+function Log.warn(m) Log.add("WARN", m) end
+function Log.err(m) Log.add("ERR", m) end
+function Log.errOnce(key, msg)
+	local n = (Log.once[key] or 0) + 1
+	Log.once[key] = n
+	if n <= 5 then Log.err(msg) else Log.suppressed = Log.suppressed + 1 end
+end
+
+Session.alive = true
+Session.gen = 0
+Session.state = "idle"        -- idle | running | paused
+Session.scanState = "idle"    -- idle | scanning | complete | error
+Session.t0 = clock()
+Session.tScanEnd = nil
+Session.stats = { visited = 0, total = 1 }
+Session.missed = 0
+Session.conns = {}
+Session.guiConns = {}
+Session.ownGui = nil
+Session.placeName = nil
+
+local function active() return Session.state == "running" end
+
+------------------------------------------------------------------------------------------------------
+-- 5. STORE (records, dedup, caps)
+------------------------------------------------------------------------------------------------------
+function Store.reset()
+	Store.lists, Store.index, Store.ids, Store.dropped = {}, {}, {}, {}
+	for _, c in ipairs(DATA_CATS) do
+		Store.lists[c] = {}
+		Store.index[c] = {}
+		Store.ids[c] = 0
+		Store.dropped[c] = 0
+	end
+	Store.byInstance = setmetatable({}, { __mode = "k" })
+	Store.seen = setmetatable({}, { __mode = "k" })
+	Store.aux = setmetatable({}, { __mode = "k" })
+	Store.notes = {}
+	Store.noteOrder = {}
+	Store.noiseCounts = {}
+end
+Store.reset()
+
+function Store.note(key, text)
+	if not Store.notes[key] then
+		Store.notes[key] = text
+		Store.noteOrder[#Store.noteOrder + 1] = key
+	end
+end
+
+function Store.upsert(cat, key, name, props, source, conf)
+	local idx = Store.index[cat]
+	local rec = idx[key]
+	if rec then
+		local p = rec.properties
+		for k, v in pairs(props) do
+			if v ~= nil then
+				if not (v == NO and p[k] ~= nil and p[k] ~= NO) then p[k] = v end
+			end
+		end
+		rec.last_updated_unix = os.time()
+		if conf and CONF_RANK[conf] > (CONF_RANK[rec.confidence] or 0) then rec.confidence = conf end
+		return rec, false
+	end
+	local list = Store.lists[cat]
+	if #list >= (CONFIG.MAX_RECORDS[cat] or 2000) then
+		Store.dropped[cat] = Store.dropped[cat] + 1
+		return nil, false
+	end
+	local n = Store.ids[cat] + 1
+	Store.ids[cat] = n
+	rec = {
+		id = string.format("%s_%05d", PREFIX[cat], n),
+		name = trunc(tostring(name)),
+		category = cat,
+		properties = props,
+		source = source,
+		collected_at = Util.iso(),
+		collected_at_unix = os.time(),
+		last_updated_unix = os.time(),
+		confidence = conf or "medium",
+	}
+	list[#list + 1] = rec
+	idx[key] = rec
+	if typeof(key) == "Instance" then
+		local b = Store.byInstance[key]
+		if not b then b = {}; Store.byInstance[key] = b end
+		b[cat] = rec
+	end
+	return rec, true
+end
+
+function Store.add(cat, rec) -- append-only (events)
+	local list = Store.lists[cat]
+	if #list >= (CONFIG.MAX_RECORDS[cat] or 2000) then
+		Store.dropped[cat] = Store.dropped[cat] + 1
+		return nil
+	end
+	list[#list + 1] = rec
+	return rec
+end
+
+function Store.total()
+	local n = 0
+	for _, c in ipairs(DATA_CATS) do n = n + #Store.lists[c] end
+	return n
+end
+function Store.filled()
+	local n = 0
+	for _, c in ipairs(DATA_CATS) do
+		if #Store.lists[c] > 0 then n = n + 1 end
+	end
+	return n
+end
+
+------------------------------------------------------------------------------------------------------
+-- 6. TOKENS + KEYWORDS (name heuristics; confidence of classification is reported per record)
+------------------------------------------------------------------------------------------------------
+local tokCache, tokN = {}, 0
+local function sing(w)
+	if #w > 3 then
+		if w:sub(-3) == "xes" or w:sub(-4) == "ches" or w:sub(-4) == "shes" then return w:sub(1, -3) end
+		if w:sub(-1) == "s" and w:sub(-2) ~= "ss" then return w:sub(1, -2) end
+	end
+	return w
+end
+Util.sing = sing
+
+function Tok.of(name)
+	local c = tokCache[name]
+	if c then return c end
+	local s = tostring(name)
+	s = s:gsub("(%l)(%u)", "%1 %2")
+	s = s:gsub("(%u)(%u%l)", "%1 %2")
+	local out = {}
+	for w in s:lower():gmatch("%a+") do out[sing(w)] = true end
+	tokN = tokN + 1
+	if tokN > 6000 then tokCache = {}; tokN = 0 end
+	tokCache[name] = out
+	return out
+end
+
+local EMPTY = {}
+local KW = {
+	box = set({ "box", "crate", "chest", "present", "gift", "parcel", "package", "caixa" }),
+	box_ex = set({ "hit", "text", "check", "select", "collision", "shadow", "bounding", "click", "input", "search", "message", "chat",
+		"drop", "dialog", "combo", "list", "tool", "mail", "sound", "selection" }),
+	weapon = set({ "weapon", "sword", "dagger", "katana", "hammer", "axe", "spear", "saber", "scythe", "blade", "mace", "wand", "bow", "pickaxe" }),
+	pet = set({ "pet", "companion" }),
+	egg = set({ "egg", "hatch", "incubator" }),
+	world = set({ "world", "island", "zone", "area", "realm", "biome" }),
+	portal = set({ "portal", "teleport", "teleporter", "warp", "gate", "entrance", "tp" }),
+	npc = set({ "npc", "vendor", "merchant", "shopkeeper", "seller", "trader" }),
+	shop = set({ "shop", "store", "market" }),
+	currency = set({ "coin", "cash", "money", "gem", "gold", "diamond", "token", "buck", "credit", "robux" }),
+	price = set({ "price", "cost", "buy", "purchase", "upgrade", "shop", "store" }),
+	mult = set({ "mult", "multiplier", "boost", "luck", "bonus" }),
+	econ = set({ "coin", "cash", "money", "gem", "gold", "diamond", "token", "currency", "buck", "credit", "price", "cost", "upgrade",
+		"mult", "multiplier", "boost", "luck", "bonus", "income", "earning", "robux" }),
+	prog = set({ "level", "lvl", "xp", "exp", "experience", "rebirth", "prestige", "stage", "rank", "progress", "milestone",
+		"requirement", "require", "required", "unlock", "unlocked", "opened", "destroyed", "broken", "playtime", "streak", "kill" }),
+	inv = set({ "inventory", "backpack", "bag", "storage", "slot", "capacity", "equipped", "equip", "owned", "limit", "collection" }),
+	invui = set({ "inventory", "backpack", "bag", "storage", "collection" }),
+	tab = set({ "tab" }),
+	menu = set({ "menu", "shop", "inventory", "settings", "index", "popup", "window", "panel", "store", "rebirth", "teleport" }),
+}
+KW.worldAll = {}
+for _, group in ipairs({ KW.world, KW.portal, KW.npc, KW.shop }) do
+	for k in pairs(group) do KW.worldAll[k] = true end
+end
+local RARITY = set({ "common", "uncommon", "rare", "epic", "legendary", "mythic", "mythical", "secret", "exotic", "divine", "celestial",
+	"godly", "ultra", "supreme", "omega", "unique" })
+local GENERIC_UI = set({ "frame", "button", "label", "image", "icon", "scroll", "scrolling", "list", "grid", "layout", "header", "title",
+	"close", "bg", "background", "padding", "container", "holder", "main", "content", "top", "bottom", "left", "right", "text", "line",
+	"divider", "shadow", "stroke", "corner", "gradient" })
+
+local function hasCurrencyWord(low)
+	for w in low:gmatch("%a+") do
+		if KW.currency[sing(w)] then return sing(w) end
+	end
+	return nil
+end
+
+local function allIn(tok, kw)
+	local any = false
+	for t in pairs(tok) do
+		any = true
+		if not kw[t] then return false end
+	end
+	return any
+end
+
+------------------------------------------------------------------------------------------------------
+-- 7. DESCRIBE HELPERS (geometry, texts, facts)
+------------------------------------------------------------------------------------------------------
+local function geometry(inst, full)
+	local g = {}
+	if inst:IsA("BasePart") then
+		g.position = plain(get(inst, "Position"))
+		g.size = plain(get(inst, "Size"))
+		g.orientation = plain(get(inst, "Orientation"))
+		if full then
+			g.anchored = get(inst, "Anchored")
+			g.can_collide = get(inst, "CanCollide")
+			g.transparency = plain(get(inst, "Transparency"))
+			g.material = plain(get(inst, "Material"))
+			g.color = plain(get(inst, "Color"))
+		end
+	elseif inst:IsA("Model") then
+		local ok, cf = pcall(inst.GetPivot, inst)
+		if ok and cf then
+			local pc = plain(cf)
+			g.position = pc.position
+			g.orientation = pc.orientation_degrees
+		end
+		if full then
+			local oks, sz = pcall(inst.GetExtentsSize, inst)
+			if oks then g.size = plain(sz) end
+			local pp = get(inst, "PrimaryPart")
+			g.primary_part = pp and pp.Name or NO
+		end
+	end
+	return g
+end
+
+-- Collect visible text from an item: GUI text, ProximityPrompt text, Billboard/Surface GUIs of 3D objects.
+local function collectTexts(root, cap)
+	local out, seen = {}, {}
+	local function add(s)
+		if type(s) == "string" and s ~= "" and not seen[s] and #out < cap then
+			seen[s] = true
+			out[#out + 1] = trunc(s)
+		end
+	end
+	local queue, qh, qt, nodes = { root }, 1, 1, 0
+	local depthOf = { [root] = 0 }
+	while qh <= qt and nodes < 600 do
+		local n = queue[qh]
+		qh = qh + 1
+		nodes = nodes + 1
+		local d = depthOf[n]
+		if n:IsA("TextLabel") or n:IsA("TextButton") or n:IsA("TextBox") then
+			add(get(n, "Text"))
+		elseif n:IsA("ProximityPrompt") then
+			add(get(n, "ActionText"))
+			add(get(n, "ObjectText"))
+		end
+		if d < 6 and #out < cap then
+			local ok, ch = pcall(n.GetChildren, n)
+			if ok then
+				for _, c in ipairs(ch) do
+					if qt < 800 then
+						qt = qt + 1
+						queue[qt] = c
+						depthOf[c] = d + 1
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function extractFacts(texts)
+	local F = { rarity = nil, damage_texts = {}, speed_texts = {}, price_texts = {}, multiplier_texts = {}, percent_texts = {},
+		requirement_texts = {}, health_texts = {}, reward_texts = {} }
+	local function add(list, s) if #list < 8 then list[#list + 1] = s end end
+	for _, s in ipairs(texts) do
+		local low = s:lower()
+		local hasDigit = low:find("%d") ~= nil
+		if low:find("%d%s*%%") then add(F.percent_texts, s) end
+		if low:find("dmg") or low:find("damage") then add(F.damage_texts, s) end
+		if low:find("speed") or low:find("cooldown") or low:find("/s%f[%A]") or low:find("per sec") then add(F.speed_texts, s) end
+		if low:find("require") or low:find("unlock") or low:find("need") or low:find("rebirth") then add(F.requirement_texts, s) end
+		if hasDigit and (low:find("%$") or low:find("price") or low:find("cost") or low:find("buy") or hasCurrencyWord(low)) then add(F.price_texts, s) end
+		if s:find("%f[%a][xX]%s*%d") or s:find("%d%s*[xX]%f[%A]") then add(F.multiplier_texts, s) end
+		if low:find("%d%s*/%s*%d") or low:find("health") or low:find("hp%f[%A]") then add(F.health_texts, s) end
+		if low:find("reward") or low:find("drop") or low:find("loot") or low:find("earn") then add(F.reward_texts, s) end
+		if not F.rarity then
+			for w in low:gmatch("%a+") do
+				if RARITY[w] then F.rarity = w break end
+			end
+		end
+	end
+	return F
+end
+
+local function normMap(attrsT, vals)
+	local m = {}
+	for k, v in pairs(attrsT) do m[Util.norm(k)] = { v = v, s = "attribute:" .. k, k = k } end
+	for k, v in pairs(vals) do
+		local nk = Util.norm(k)
+		if not m[nk] and type(v) ~= "table" then m[nk] = { v = v, s = "value_object:" .. k, k = k } end
+	end
+	return m
+end
+
+local function pickField(m, aliases)
+	for _, a in ipairs(aliases) do
+		local e = m[a]
+		if e and e.v ~= nil then return e.v, e.s end
+	end
+	return nil, nil
+end
+
+local function multipliersFrom(m)
+	local out, n = {}, 0
+	for nk, e in pairs(m) do
+		if (nk:find("mult") or nk:find("boost") or nk:find("luck") or nk:find("bonus")) and n < 20 then
+			out[e.k] = e.v
+			n = n + 1
+		end
+	end
+	return out, n
+end
+
+local function setField(P, FS, name, v, src)
+	if v ~= nil then
+		P[name] = v
+		if src then FS[name] = src end
+	else
+		P[name] = NO
+	end
+end
+
+local A = {
+	health_current = { "health", "hp", "currenthealth", "curhealth", "currenthp", "boxhealth", "hitpoints" },
+	health_max = { "maxhealth", "maxhp", "totalhealth", "fullhealth", "maxhitpoints" },
+	rarity = { "rarity", "tier", "grade", "quality" },
+	damage = { "damage", "dmg", "power", "attackdamage", "basedamage", "attack" },
+	speed = { "attackspeed", "speed", "cooldown", "attackcooldown", "swingspeed", "firerate", "attackrate", "delay" },
+	wtype = { "weapontype", "type", "class", "category", "kind" },
+	unlock = { "unlock", "requirement", "requirements", "required", "requiredlevel", "requiredrebirth", "requiredrebirths", "unlockat",
+		"unlockedat", "level", "rebirth" },
+	price = { "price", "cost", "buyprice", "eggprice", "buycost" },
+	currency = { "currency", "currencytype", "pricetype", "paywith", "currencyname" },
+	category = { "category", "type", "kind", "element", "class", "group" },
+	world = { "world", "area", "zone", "island", "realm" },
+	dest = { "destination", "target", "teleportto", "goto", "to", "targetworld" },
+}
+
+------------------------------------------------------------------------------------------------------
+-- 8. ROOTS + CTX
+------------------------------------------------------------------------------------------------------
+function Roots.tagOf(inst)
+	if PlayerGui and inst:IsDescendantOf(PlayerGui) then return "playergui" end
+	if inst:IsDescendantOf(Workspace) then return "workspace" end
+	if inst:IsDescendantOf(ReplicatedStorage) then return "replicated" end
+	if inst:IsDescendantOf(LocalPlayer) then return "player" end
+	return "other"
+end
+
+function Roots.list()
+	local list = {}
+	local function add(label, inst, tag, visitRoot)
+		if inst then list[#list + 1] = { label = label, inst = inst, tag = tag, visitRoot = visitRoot } end
+	end
+	add("ReplicatedStorage", ReplicatedStorage, "replicated")
+	add("ReplicatedFirst", svc("ReplicatedFirst"), "replicated")
+	add("Workspace", Workspace, "workspace")
+	add("PlayerGui", PlayerGui, "playergui")
+	add("LocalPlayer", LocalPlayer, "player", true)
+	add("StarterPack", svc("StarterPack"), "other")
+	add("Lighting", Lighting, "other")
+	add("Teams", svc("Teams"), "other")
+	return list
+end
+
+local OtherPlayers = {}
+local function refreshOtherPlayers()
+	OtherPlayers = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer then
+			OtherPlayers[p.Name] = true
+			OtherPlayers[tostring(p.UserId)] = true
+		end
+	end
+end
+refreshOtherPlayers()
+
+-- True when a dynamically added instance lives inside a character/folder that belongs to another player or our own character.
+local function insideExcluded(inst)
+	local cur = inst.Parent
+	local steps = 0
+	local myChar = LocalPlayer.Character
+	while cur and cur ~= game and steps < 12 do
+		if cur == myChar then return true end
+		if cur:IsA("Model") and Players:GetPlayerFromCharacter(cur) then return true end
+		if (cur:IsA("Folder") or cur:IsA("Model")) and OtherPlayers[cur.Name] then return true end
+		cur = cur.Parent
+		steps = steps + 1
+	end
+	return false
+end
+
+local CtxMT = {}
+CtxMT.__index = CtxMT
+function CtxMT:attrs() if not self._a then self._a = Util.attrs(self.inst) end return self._a end
+function CtxMT:vals() if not self._v then self._v = Util.valueChildren(self.inst) end return self._v end
+function CtxMT:path() if not self._p then self._p = path(self.inst) end return self._p end
+function CtxMT:tags() if not self._t then self._t = Util.tags(self.inst) end return self._t end
+
+function Ctx.make(inst, tag, phase)
+	local parent = inst.Parent
+	local ctx = setmetatable({
+		inst = inst, cls = inst.ClassName, rootTag = tag, phase = phase, parent = parent,
+		parentCls = parent and parent.ClassName or "",
+		nameTok = Tok.of(inst.Name),
+		parentTok = parent and Tok.of(parent.Name) or EMPTY,
+		isGuiObj = inst:IsA("GuiObject"),
+	}, CtxMT)
+	ctx.isText = ctx.isGuiObj and (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox"))
+	return ctx
+end
+
+local function ancestorTokens(inst, n)
+	local tok, names = {}, {}
+	local cur, i = inst, 0
+	while cur and i <= n and cur ~= PlayerGui and cur ~= game do
+		for t in pairs(Tok.of(cur.Name)) do tok[t] = true end
+		names[#names + 1] = cur.Name
+		cur = cur.Parent
+		i = i + 1
+	end
+	return tok, names
+end
+
+------------------------------------------------------------------------------------------------------
+-- 9. EVENTS, WATCHERS, QUEUE
+------------------------------------------------------------------------------------------------------
+Events.lim = {}
+Events.limCount = 0
+Events.muted = 0
+Events.skipped = 0
+function Events.reset()
+	Events.lim, Events.limCount, Events.muted, Events.skipped = {}, 0, 0, 0
+end
+
+function Events.push(kind, inst, rec, prop, old, new, extra)
+	if not active() then
+		Session.missed = Session.missed + 1
+		return
+	end
+	local t = clock()
+	if not (extra and extra.noLimit) then
+		local key = kind .. ":" .. (inst and Util.uid(inst) or 0) .. ":" .. tostring(prop)
+		local lim = Events.lim[key]
+		if lim then
+			if lim.muted then return end
+			if t - lim.t < CONFIG.EVENT_MIN_INTERVAL then
+				Events.skipped = Events.skipped + 1
+				return
+			end
+			lim.n = lim.n + 1
+			if lim.n > CONFIG.EVENT_MAX_PER_KEY then
+				lim.muted = true
+				Events.muted = Events.muted + 1
+				return
+			end
+			lim.t = t
+		else
+			Events.limCount = Events.limCount + 1
+			if Events.limCount > 5000 then Events.lim = {}; Events.limCount = 0 end
+			Events.lim[key] = { t = t, n = 1 }
+		end
+	end
+	local related = {}
+	if inst then
+		local b = Store.byInstance[inst]
+		if b then
+			for cat, r in pairs(b) do related[cat] = r.id end
+		end
+	end
+	local n = Store.ids.observed_events + 1
+	Store.ids.observed_events = n
+	local P = {
+		event = kind,
+		target_id = rec and rec.id or NO,
+		target_category = rec and rec.category or NO,
+		target_name = rec and rec.name or (inst and inst.Name) or NO,
+		target_path = inst and path(inst) or NO,
+		property = prop ~= nil and tostring(prop) or NO,
+		old_value = old ~= nil and plain(old) or NULL,
+		new_value = new ~= nil and plain(new) or NULL,
+		related_records = related,
+		session_seconds = r2(t - Session.t0),
+		world_hint = World.current or NO,
+	}
+	if extra then
+		for k, v in pairs(extra) do
+			if k ~= "noLimit" then P[k] = plain(v) end
+		end
+	end
+	Store.add("observed_events", {
+		id = string.format("%s_%05d", PREFIX.observed_events, n),
+		name = kind,
+		category = "observed_events",
+		properties = P,
+		source = "event:" .. kind,
+		collected_at = Util.iso(),
+		collected_at_unix = os.time(),
+		last_updated_unix = os.time(),
+		confidence = "high",
+	})
+end
+
+Watch.conns = {}
+Watch.count = 0
+Watch.capHit = false
+
+function Watch.add(inst, key, signal, fn)
+	local bucket = Watch.conns[inst]
+	if bucket and bucket[key] then return false end
+	if Watch.count >= CONFIG.MAX_WATCHERS then
+		Watch.capHit = true
+		return false
+	end
+	local g = Session.gen
+	local ok, c = pcall(function()
+		return signal:Connect(function(...)
+			if g ~= Session.gen or not Session.alive then return end
+			local okc, err = pcall(fn, ...)
+			if not okc then Log.errOnce("watch:" .. key, "watcher " .. key .. ": " .. tostring(err)) end
+		end)
+	end)
+	if not ok then return false end
+	if not bucket then bucket = {}; Watch.conns[inst] = bucket end
+	bucket[key] = c
+	Watch.count = Watch.count + 1
+	return true
+end
+
+function Watch.drop(inst)
+	local bucket = Watch.conns[inst]
+	if not bucket then return end
+	for _, c in pairs(bucket) do
+		pcall(function() c:Disconnect() end)
+		Watch.count = Watch.count - 1
+	end
+	Watch.conns[inst] = nil
+end
+
+function Watch.dropAll()
+	for inst in pairs(Watch.conns) do Watch.drop(inst) end
+	Watch.conns = {}
+	Watch.count = 0
+	Watch.capHit = false
+end
+
+local ITEM_CATS = { "worlds", "boxes", "weapons", "pets", "eggs" }
+
+function Watch.ensureAttr(inst)
+	Watch.add(inst, "attr", inst.AttributeChanged, function(name) Watch.onAttr(inst, name) end)
+end
+
+function Watch.ensureValue(inst)
+	Watch.add(inst, "value", inst.Changed, function() Watch.onValue(inst) end)
+end
+
+-- Item category records react to attribute/value changes by re-reading the instance (read-only).
+function Watch.itemChanged(inst, cat, rec, what, old, new)
+	local oldHealth = rec.properties.health_current
+	Items.refresh(inst, cat)
+	if cat == "boxes" then Boxes.onChange(rec, oldHealth, what, old, new) end
+	Events.push("property_changed", inst, rec, what, old, new)
+end
+
+function Watch.onAttr(inst, name)
+	local okv, raw = pcall(inst.GetAttribute, inst, name)
+	local newv = okv and plain(raw) or NULL
+	local recs = Store.byInstance[inst]
+	if recs then
+		for _, cat in ipairs(ITEM_CATS) do
+			local rec = recs[cat]
+			if rec then
+				local old = rec.properties.attributes and rec.properties.attributes[name]
+				if old ~= newv then Watch.itemChanged(inst, cat, rec, "attribute:" .. name, old, newv) end
+			end
+		end
+	end
+	local key = "a:" .. Util.uid(inst) .. ":" .. name
+	for _, cat in ipairs({ "economy", "progression" }) do
+		local r = Store.index[cat][key]
+		if r then
+			local old = r.properties.value
+			if old ~= newv then
+				r.properties.value = newv
+				local kind = hit(Tok.of(name), KW.world) and "world_changed" or "value_changed"
+				Events.push(kind, inst, r, name, old, newv)
+			end
+		end
+	end
+	-- attribute may be new: let the economy/progression modules pick it up
+	if okv then
+		Economy.scanAttrs(inst, nil, name)
+		Progression.scanAttrs(inst, nil, name)
+	end
+end
+
+function Watch.onValue(inst)
+	local recs = Store.byInstance[inst]
+	if not recs then return end
+	local newv = plain(get(inst, "Value"))
+	for _, cat in ipairs({ "economy", "progression", "inventory" }) do
+		local r = recs[cat]
+		if r then
+			local old = r.properties.value
+			if old ~= newv then
+				r.properties.value = newv
+				local kind = hit(Tok.of(inst.Name), KW.world) and "world_changed" or (cat == "inventory" and "inventory_changed" or "value_changed")
+				Events.push(kind, inst, r, "Value", old, newv)
+			end
+		end
+	end
+end
+
+-- Item (3D) specific watchers: Humanoid health, ValueBase children, Transparency (box state).
+function Watch.attachItem(inst, rec, cat)
+	Watch.ensureAttr(inst)
+	local ok, ch = pcall(inst.GetChildren, inst)
+	if ok then
+		local nv = 0
+		for _, c in ipairs(ch) do
+			if nv >= 15 then break end
+			if c:IsA("ValueBase") then
+				nv = nv + 1
+				Watch.add(c, "ivalue", c.Changed, function()
+					local old = rec.properties.value_children and rec.properties.value_children[c.Name]
+					local new = plain(get(c, "Value"))
+					if old ~= new then Watch.itemChanged(inst, cat, rec, "value_object:" .. c.Name, old, new) end
+				end)
+			elseif c:IsA("Humanoid") and cat == "boxes" then
+				nv = nv + 1
+				Watch.add(c, "hum", c.HealthChanged, function(h)
+					Watch.itemChanged(inst, cat, rec, "Humanoid.Health", rec.properties.health_current, h)
+				end)
+			end
+		end
+	end
+	if cat == "boxes" and inst:IsA("BasePart") then
+		Watch.add(inst, "transp", inst:GetPropertyChangedSignal("Transparency"), function()
+			Watch.itemChanged(inst, cat, rec, "Transparency", nil, get(inst, "Transparency"))
+		end)
+	end
+end
+
+-- UI watchers: text and visibility.
+function Watch.ui(inst, rec, ctx)
+	if ctx.isText then
+		local t = get(inst, "Text")
+		if type(t) == "string" and t:find("%d") then
+			Watch.add(inst, "text", inst:GetPropertyChangedSignal("Text"), function() Watch.onText(inst, rec) end)
+		end
+	end
+	if inst:IsA("LayerCollector") then
+		Watch.add(inst, "vis", inst:GetPropertyChangedSignal("Enabled"), function()
+			local v = get(inst, "Enabled")
+			local old = rec.properties.enabled
+			if old ~= v then
+				rec.properties.enabled = v
+				Events.push("ui_enabled_changed", inst, rec, "Enabled", old, v)
+			end
+		end)
+	elseif ctx.isGuiObj and ctx.parent and (ctx.parent:IsA("LayerCollector") or (ctx.parent.Parent and ctx.parent.Parent:IsA("LayerCollector"))) then
+		Watch.add(inst, "vis", inst:GetPropertyChangedSignal("Visible"), function()
+			local v = get(inst, "Visible")
+			local old = rec.properties.visible
+			if old ~= v then
+				rec.properties.visible = v
+				rec.properties.effective_visible = Hooks.effectiveVisible(inst)
+				Events.push("ui_visibility_changed", inst, rec, "Visible", old, v)
+			end
+		end)
+	end
+end
+
+function Watch.onText(inst, rec)
+	local t = get(inst, "Text")
+	if type(t) ~= "string" then return end
+	local tt = trunc(t)
+	local old = rec.properties.text
+	if old == tt then return end
+	if not active() then
+		Session.missed = Session.missed + 1
+		return
+	end
+	rec.properties.text = tt
+	rec.properties.last_changed_unix = os.time()
+	Events.push("text_changed", inst, rec, "Text", old, tt)
+	-- propagate to modules that derive facts from texts
+	Economy.onText(inst, t)
+	Progression.onText(inst, t)
+	local cur = inst
+	for _ = 1, 6 do
+		cur = cur.Parent
+		if not cur then break end
+		local recs = Store.byInstance[cur]
+		if recs then
+			for _, cat in ipairs(ITEM_CATS) do
+				if recs[cat] then Items.refresh(cur, cat) end
+			end
+		end
+	end
+end
+
+function Hooks.effectiveVisible(inst)
+	local cur = inst
+	local n = 0
+	while cur and cur ~= PlayerGui and n < 40 do
+		if cur:IsA("GuiObject") then
+			if get(cur, "Visible") == false then return false end
+		elseif cur:IsA("LayerCollector") then
+			if get(cur, "Enabled") == false then return false end
+		end
+		cur = cur.Parent
+		n = n + 1
+	end
+	return true
+end
+
+Queue.items, Queue.head, Queue.tail, Queue.dropped = {}, 1, 0, 0
+Queue.set = setmetatable({}, { __mode = "k" })
+Queue.removed = {}
+function Queue.reset()
+	Queue.items, Queue.head, Queue.tail = {}, 1, 0
+	Queue.set = setmetatable({}, { __mode = "k" })
+	Queue.removed = {}
+end
+function Queue.push(inst)
+	if Queue.set[inst] or Store.seen[inst] then return end
+	if Queue.tail - Queue.head + 1 >= CONFIG.MAX_QUEUE then
+		Queue.dropped = Queue.dropped + 1
+		return
+	end
+	Queue.tail = Queue.tail + 1
+	Queue.items[Queue.tail] = { inst, clock() }
+	Queue.set[inst] = true
+end
+function Queue.process(budget)
+	local t0 = clock()
+	local n = 0
+	while Queue.head <= Queue.tail and n < CONFIG.QUEUE_PER_STEP do
+		local it = Queue.items[Queue.head]
+		if t0 - it[2] < 0.2 then break end -- let children/attributes replicate first
+		Queue.items[Queue.head] = nil
+		Queue.head = Queue.head + 1
+		local inst = it[1]
+		Queue.set[inst] = nil
+		local own = Session.ownGui
+		if inst.Parent and not Store.seen[inst] and not (own and inst:IsDescendantOf(own)) and not insideExcluded(inst) then
+			local ok, err = pcall(Visit.dynamic, inst)
+			if not ok then Log.errOnce("queue", "dynamic visit: " .. tostring(err)) end
+		end
+		n = n + 1
+		if clock() - t0 > budget then break end
+	end
+	if Queue.head > Queue.tail then Queue.head, Queue.tail = 1, 0 end
+end
+
+------------------------------------------------------------------------------------------------------
+-- 10. MODULES
+------------------------------------------------------------------------------------------------------
+local Modules = {}
+local function addModule(name, visitFn)
+	local m = { name = name, visit = visitFn, errors = 0, disabled = false }
+	Modules[#Modules + 1] = m
+	return m
+end
+
+---- A. STRUCTURE (objects) -----------------------------------------------------------------------
+local Structure = {}
+function Structure.services()
+	local ok, ch = pcall(game.GetChildren, game)
+	if not ok then return end
+	for _, s in ipairs(ch) do
+		local okc, kids = pcall(function() return #s:GetChildren() end)
+		Store.upsert("objects", s, s.Name, { kind = "service", class = s.ClassName, accessible_children = okc and kids or NO, path = path(s) },
+			"client_instance:game." .. s.Name, "high")
+	end
+	local streaming = get(Workspace, "StreamingEnabled")
+	if type(streaming) ~= "boolean" then streaming = NO end
+	Store.upsert("objects", "meta:workspace", "Workspace.StreamingEnabled",
+		{ kind = "setting", streaming_enabled = streaming }, "client_instance:Workspace", "high")
+end
+
+addModule("structure", function(inst, ctx)
+	if ctx.rootTag == "playergui" then return end
+	local cls = ctx.cls
+	if NOISE[cls] then
+		local a = ctx:attrs()
+		if next(a) == nil then
+			Store.noiseCounts[cls] = (Store.noiseCounts[cls] or 0) + 1
+			return
+		end
+	end
+	local P = { class = cls, path = ctx:path(), root = ctx.rootTag, parent = ctx.parent and path(ctx.parent) or NO }
+	for k, v in pairs(geometry(inst, false)) do P[k] = v end
+	local a = ctx:attrs()
+	if next(a) ~= nil then P.attributes = a end
+	local tg = ctx:tags()
+	if #tg > 0 then P.tags = tg end
+	if ctx.phase == "dynamic" then P.loaded_dynamically = true else P.loaded_dynamically = false end
+	if inst:IsA("ValueBase") then
+		P.value = plain(get(inst, "Value"))
+	elseif inst:IsA("Tool") then
+		P.tool_tip = trunc(tostring(get(inst, "ToolTip") or ""))
+	elseif inst:IsA("ProximityPrompt") then
+		P.action_text = plain(get(inst, "ActionText"))
+		P.object_text = plain(get(inst, "ObjectText"))
+		P.hold_duration = plain(get(inst, "HoldDuration"))
+		P.max_activation_distance = plain(get(inst, "MaxActivationDistance"))
+		P.enabled = get(inst, "Enabled")
+	elseif inst:IsA("ClickDetector") then
+		P.max_activation_distance = plain(get(inst, "MaxActivationDistance"))
+	elseif inst:IsA("Humanoid") then
+		P.health = plain(get(inst, "Health"))
+		P.max_health = plain(get(inst, "MaxHealth"))
+		P.display_name = plain(get(inst, "DisplayName"))
+	elseif inst:IsA("LuaSourceContainer") then
+		P.is_script = true
+		P.script_source = "never_read"
+	elseif inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("BindableEvent") or inst:IsA("UnreliableRemoteEvent") then
+		P.remote_note = "listed_by_name_only_never_invoked"
+	elseif inst:IsA("MeshPart") then
+		P.mesh_id = plain(get(inst, "MeshId"))
+		P.texture_id = plain(get(inst, "TextureID"))
+	elseif inst:IsA("LayerCollector") then
+		P.enabled = get(inst, "Enabled")
+		P.adornee = plain(get(inst, "Adornee"))
+	elseif inst:IsA("Sound") then
+		P.sound_id = plain(get(inst, "SoundId"))
+	end
+	Store.upsert("objects", inst, inst.Name, P, "client_instance:" .. P.path .. " (" .. ctx.phase .. ")", "high")
+end)
+
+---- generic item modules (worlds, boxes, weapons, pets, eggs) -------------------------------------
+Items.specs = {}
+
+local function isEntity3D(inst)
+	return inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Tool") or inst:IsA("Configuration") or inst:IsA("Accessory")
+end
+
+function Items.match(inst, ctx, spec)
+	local cls = ctx.cls
+	if ctx.rootTag == "playergui" then
+		if not spec.ui or not ctx.isGuiObj then return nil end
+		if not (inst:IsA("GuiButton") or cls == "Frame" or cls == "ImageLabel" or cls == "ViewportFrame") then return nil end
+		if (ctx.parentCls == "Frame" or ctx.parentCls == "ScrollingFrame") then
+			local par = hit(ctx.parentTok, spec.kw)
+			if par then return "ui_container_child", par end
+		end
+		local own = hit(ctx.nameTok, spec.kw)
+		if own and inst:IsA("GuiButton") then return "ui_named_button", own end
+		return nil
+	end
+	if spec.tool and cls == "Tool" then return "tool_class", "tool" end
+	if not isEntity3D(inst) then return nil end
+	local own = hit(ctx.nameTok, spec.kw)
+	if own and not (spec.ex and hit(ctx.nameTok, spec.ex)) then
+		if ctx.parent and (ctx.parentCls == "Model" or ctx.parent:IsA("BasePart")) and hit(ctx.parentTok, spec.kw) then return nil end
+		return "self_name", own
+	end
+	if ctx.parent and (ctx.parentCls == "Folder" or ctx.parentCls == "Configuration") then
+		local par = hit(ctx.parentTok, spec.kw)
+		if par then return "container_child", par end
+	end
+	return nil
+end
+
+function Items.record(inst, ctx, spec, reason, kwHit)
+	local cat = spec.cat
+	local isUI = ctx.rootTag == "playergui"
+	local attrsT = ctx:attrs()
+	local vals = ctx:vals()
+	local p = ctx:path()
+	local P = {
+		kind = isUI and "ui_item" or (ctx.cls == "Tool" and "tool" or "instance"),
+		class = ctx.cls, path = p, root = ctx.rootTag, match_reason = reason, matched_keyword = kwHit,
+		attributes = attrsT, value_children = vals, tags = ctx:tags(),
+	}
+	if ctx.phase == "dynamic" then P.loaded_dynamically = true elseif ctx.phase == "initial_scan" then P.loaded_dynamically = false end
+	if isUI then
+		P.visible = get(inst, "Visible")
+		P.effective_visible = Hooks.effectiveVisible(inst)
+		P.absolute_position = plain(get(inst, "AbsolutePosition"))
+		P.absolute_size = plain(get(inst, "AbsoluteSize"))
+		if inst:IsA("ImageButton") or inst:IsA("ImageLabel") then P.image = plain(get(inst, "Image")) end
+	else
+		for k, v in pairs(geometry(inst, true)) do P[k] = v end
+		local par = ctx.parent
+		if par then
+			local pn = par.Name
+			if pn == LocalPlayer.Name or pn == tostring(LocalPlayer.UserId) then P.follows_local_player = true end
+		end
+	end
+	local texts = {}
+	if ctx.cls ~= "Tool" then texts = collectTexts(inst, 40) end
+	if ctx.cls == "Tool" then
+		local tip = get(inst, "ToolTip")
+		if type(tip) == "string" and tip ~= "" then texts[#texts + 1] = trunc(tip) end
+	end
+	if isUI and #texts == 0 and reason == "ui_container_child" and allIn(ctx.nameTok, GENERIC_UI) then return nil end
+	P.ui_texts = L(texts)
+	local facts = extractFacts(texts)
+	local FS = {}
+	local m = normMap(attrsT, vals)
+	spec.fields(P, FS, m, facts, inst, ctx, kwHit)
+	P.field_sources = FS
+	local existing = Store.index[cat][inst]
+	if existing and spec.keep then
+		for _, k in ipairs(spec.keep) do P[k] = nil end
+	end
+	local conf = isUI and "low" or "medium"
+	local rec, created = Store.upsert(cat, inst, inst.Name, P, "client_instance:" .. p .. " (" .. ctx.phase .. ")", conf)
+	if rec and created then Store.aux[rec] = { t_first = clock() } end
+	return rec, created
+end
+
+function Items.refresh(inst, cat)
+	local spec = Items.specs[cat]
+	if not spec then return nil end
+	local b = Store.byInstance[inst]
+	local old = b and b[cat]
+	local tag = old and old.properties.root or Roots.tagOf(inst)
+	local ctx = Ctx.make(inst, tag, "refresh")
+	return Items.record(inst, ctx, spec, old and old.properties.match_reason or "refresh", old and old.properties.matched_keyword)
+end
+
+function Items.makeModule(spec)
+	Items.specs[spec.cat] = spec
+	return addModule(spec.cat, function(inst, ctx)
+		local reason, kwHit = Items.match(inst, ctx, spec)
+		if not reason then return end
+		local rec, created = Items.record(inst, ctx, spec, reason, kwHit)
+		if rec and created then
+			Watch.attachItem(inst, rec, spec.cat)
+			if ctx.phase == "dynamic" then Events.push("object_added", inst, rec, nil, nil, nil, { noLimit = true }) end
+		elseif rec and ctx.rootTag == "playergui" and spec.ui then
+			Watch.ensureAttr(inst)
+		end
+	end)
+end
+
+local function childListing(inst, kw)
+	local out = {}
+	local ok, ch = pcall(inst.GetChildren, inst)
+	if not ok then return out end
+	for _, c in ipairs(ch) do
+		if (c:IsA("Folder") or c:IsA("Configuration") or c:IsA("Model")) and hit(Tok.of(c.Name), kw) then
+			local ok2, gc = pcall(c.GetChildren, c)
+			if ok2 then
+				for _, g in ipairs(gc) do
+					if #out >= 80 then break end
+					local entry = { name = g.Name, class = g.ClassName }
+					if g:IsA("ValueBase") then entry.value = plain(get(g, "Value")) end
+					local ga = Util.attrs(g)
+					if next(ga) ~= nil then entry.attributes = ga end
+					out[#out + 1] = entry
+				end
+			end
+		end
+	end
+	return out
+end
+local LIST_KW = set({ "pet", "drop", "reward", "loot", "chance", "possible", "content", "result" })
+
+local function containerRarity(inst)
+	local par = inst.Parent
+	if par then
+		local r = hit(Tok.of(par.Name), RARITY)
+		if r then return r end
+	end
+	return nil
+end
+
+---- C. BOXES -------------------------------------------------------------------------------------
+Items.makeModule({
+	cat = "boxes", kw = KW.box, ex = KW.box_ex, ui = false,
+	keep = { "state_changes", "observed_lifetime_seconds", "observed_time_to_destroy_seconds", "destroyed_observed",
+		"first_damage_seen_session_seconds", "removed_observed" },
+	fields = function(P, FS, m, facts, inst)
+		local hc, hcs = pickField(m, A.health_current)
+		local hm, hms = pickField(m, A.health_max)
+		if hc == nil or hm == nil then
+			local hum = inst:FindFirstChildOfClass("Humanoid")
+			if hum then
+				if hc == nil then hc, hcs = plain(get(hum, "Health")), "humanoid:Health" end
+				if hm == nil then hm, hms = plain(get(hum, "MaxHealth")), "humanoid:MaxHealth" end
+			end
+		end
+		if hc == nil or hm == nil then
+			for _, t in ipairs(facts.health_texts) do
+				local a, b = t:match("(%d[%d,%.]*%a*)%s*/%s*(%d[%d,%.]*%a*)")
+				if a and b then
+					if hc == nil then hc, hcs = parseNumber(a), "gui_text:" .. t end
+					if hm == nil then hm, hms = parseNumber(b), "gui_text:" .. t end
+					break
+				end
+			end
+		end
+		setField(P, FS, "health_current", hc, hcs)
+		setField(P, FS, "health_max", hm, hms)
+		local rewards, n = {}, 0
+		for nk, e in pairs(m) do
+			if (nk:find("reward") or nk:find("drop") or nk:find("loot") or nk:find("payout") or nk:find("coin") or nk:find("gem") or nk:find("xp")
+				or nk:find("value")) and n < 20 then
+				rewards[e.k] = e.v
+				n = n + 1
+			end
+		end
+		local rt = {}
+		for _, t in ipairs(facts.reward_texts) do rt[#rt + 1] = t end
+		P.rewards_announced = (n > 0 or #rt > 0) and { attributes_or_values = rewards, texts = L(rt) } or NO
+		local rar, rars = pickField(m, A.rarity)
+		setField(P, FS, "rarity", rar or facts.rarity, rars or (facts.rarity and "gui_text") or nil)
+		P.observed_lifetime_seconds = NO
+		P.observed_time_to_destroy_seconds = NO
+		P.destroyed_observed = false
+		P.lifetime_basis = "since_first_observed_by_this_client"
+		P.state_changes = L({})
+	end,
+})
+
+function Boxes.onChange(rec, oldHealth, what, old, new)
+	local P = rec.properties
+	local a = Store.aux[rec]
+	local st = P.state_changes
+	if type(st) == "table" and #st < 40 then
+		st[#st + 1] = { session_seconds = r2(clock() - Session.t0), what = what, old = plain(old), new = plain(new), health = P.health_current }
+	end
+	local nh = P.health_current
+	if type(nh) == "number" and a then
+		local dropped = (type(oldHealth) == "number" and nh < oldHealth) or (type(P.health_max) == "number" and nh < P.health_max)
+		if dropped and not a.t_damage then
+			a.t_damage = clock()
+			P.first_damage_seen_session_seconds = r2(a.t_damage - Session.t0)
+		end
+	end
+end
+
+function Boxes.onRemoved(rec, tRemoved)
+	local P = rec.properties
+	local a = Store.aux[rec]
+	P.destroyed_observed = true
+	if a then
+		P.observed_lifetime_seconds = r2(tRemoved - a.t_first)
+		if a.t_damage then P.observed_time_to_destroy_seconds = r2(tRemoved - a.t_damage) end
+	end
+end
+
+---- E/F. WEAPONS, PETS, EGGS ---------------------------------------------------------------------
+Items.makeModule({
+	cat = "weapons", kw = KW.weapon, ui = true, tool = true,
+	fields = function(P, FS, m, facts, inst, ctx, kwHit)
+		local v, s = pickField(m, A.wtype)
+		if v == nil and kwHit and kwHit ~= "weapon" and kwHit ~= "tool" then v, s = kwHit, "name_keyword" end
+		setField(P, FS, "weapon_type", v, s)
+		local rar, rars = pickField(m, A.rarity)
+		if rar == nil and facts.rarity then rar, rars = facts.rarity, "gui_text" end
+		if rar == nil then
+			local cr = containerRarity(inst)
+			if cr then rar, rars = cr, "container_name" end
+		end
+		setField(P, FS, "rarity", rar, rars)
+		local d, ds = pickField(m, A.damage)
+		if d == nil and facts.damage_texts[1] then d, ds = parseNumber(facts.damage_texts[1]), "gui_text:" .. facts.damage_texts[1] end
+		setField(P, FS, "damage", d, ds)
+		P.damage_text = facts.damage_texts[1] or NO
+		local sp, sps = pickField(m, A.speed)
+		if sp == nil and facts.speed_texts[1] then sp, sps = parseNumber(facts.speed_texts[1]), "gui_text:" .. facts.speed_texts[1] end
+		setField(P, FS, "attack_speed", sp, sps)
+		P.attack_speed_text = facts.speed_texts[1] or NO
+		local u, us = pickField(m, A.unlock)
+		if u == nil and facts.requirement_texts[1] then u, us = facts.requirement_texts[1], "gui_text" end
+		setField(P, FS, "unlock_requirements", u, us)
+		local pr, prs = pickField(m, A.price)
+		if pr == nil and facts.price_texts[1] then pr, prs = facts.price_texts[1], "gui_text" end
+		setField(P, FS, "price", pr, prs)
+		local mu, mn = multipliersFrom(m)
+		for _, t in ipairs(facts.multiplier_texts) do mu["text:" .. t] = true end
+		P.multipliers = next(mu) ~= nil and mu or NO
+	end,
+})
+
+Items.makeModule({
+	cat = "pets", kw = KW.pet, ui = true,
+	fields = function(P, FS, m, facts, inst)
+		local rar, rars = pickField(m, A.rarity)
+		if rar == nil and facts.rarity then rar, rars = facts.rarity, "gui_text" end
+		if rar == nil then
+			local cr = containerRarity(inst)
+			if cr then rar, rars = cr, "container_name" end
+		end
+		setField(P, FS, "rarity", rar, rars)
+		local mu = multipliersFrom(m)
+		for _, t in ipairs(facts.multiplier_texts) do mu["text:" .. t] = true end
+		P.multipliers = next(mu) ~= nil and mu or NO
+		local c, cs = pickField(m, A.category)
+		setField(P, FS, "category", c, cs)
+		local evo, n = {}, 0
+		for nk, e in pairs(m) do
+			if (nk:find("evolv") or nk:find("fuse") or nk:find("fusion") or nk:find("golden") or nk:find("rainbow") or nk:find("shiny")
+				or nk:find("upgradeto")) and n < 15 then
+				evo[e.k] = e.v
+				n = n + 1
+			end
+		end
+		P.evolution_fusion_info = n > 0 and evo or NO
+	end,
+})
+
+Items.makeModule({
+	cat = "eggs", kw = KW.egg, ui = true,
+	fields = function(P, FS, m, facts, inst)
+		local pr, prs = pickField(m, A.price)
+		local cur, curs = pickField(m, A.currency)
+		local ptext = facts.price_texts[1]
+		if pr == nil and ptext then pr, prs = parseNumber(ptext), "gui_text:" .. ptext end
+		if cur == nil and ptext then
+			local w = hasCurrencyWord(ptext:lower())
+			if w then cur, curs = w, "gui_text:" .. ptext elseif ptext:find("%$") then cur, curs = "$", "gui_text:" .. ptext end
+		end
+		setField(P, FS, "price", pr, prs)
+		P.price_text = ptext or NO
+		setField(P, FS, "currency", cur, curs)
+		local pets = {}
+		if not inst:IsA("GuiObject") then pets = childListing(inst, LIST_KW) end
+		P.pets_possible = #pets > 0 and L(pets) or NO
+		local probs = {}
+		for _, t in ipairs(facts.percent_texts) do
+			probs[#probs + 1] = { text = t, percent = tonumber((t:match("(%d[%d%.]*)%s*%%"))) or NULL }
+		end
+		P.probabilities_published_in_ui = #probs > 0 and L(probs) or NO
+		local w, ws = pickField(m, A.world)
+		setField(P, FS, "world", w or World.current, w and ws or (World.current and "current_world_hint") or nil)
+	end,
+})
+
+---- B. WORLDS (worlds, portals, npcs, shops) ----------------------------------------------------
+Items.makeModule({
+	cat = "worlds", kw = KW.worldAll, ui = true,
+	fields = function(P, FS, m, facts, inst, ctx, kwHit)
+		local tok = ctx.nameTok
+		local kind = "world"
+		if hit(tok, KW.portal) then kind = "portal"
+		elseif hit(tok, KW.npc) then kind = "npc"
+		elseif hit(tok, KW.shop) then kind = "shop"
+		elseif kwHit and KW.portal[kwHit] then kind = "portal"
+		elseif kwHit and KW.npc[kwHit] then kind = "npc"
+		elseif kwHit and KW.shop[kwHit] then kind = "shop" end
+		if ctx.rootTag ~= "playergui" and inst:IsA("Model") then
+			local hum = inst:FindFirstChildOfClass("Humanoid")
+			if hum and kind == "world" then kind = "humanoid_model_possible_npc" end
+		end
+		P.world_kind = kind
+		local u, us = pickField(m, A.unlock)
+		if u == nil and facts.requirement_texts[1] then u, us = facts.requirement_texts[1], "gui_text" end
+		setField(P, FS, "unlock_requirements", u, us)
+		local d, dsrc = pickField(m, A.dest)
+		setField(P, FS, "destination_hint", d, dsrc)
+		local interactive = {}
+		if ctx.rootTag ~= "playergui" then
+			if inst:FindFirstChildWhichIsA("ProximityPrompt", true) then interactive[#interactive + 1] = "ProximityPrompt" end
+			if inst:FindFirstChildWhichIsA("ClickDetector", true) then interactive[#interactive + 1] = "ClickDetector" end
+		end
+		P.interactions_found = L(interactive)
+	end,
+})
+
+------------------------------------------------------------------------------------------------------
+-- G. ECONOMY / PROGRESSION
+------------------------------------------------------------------------------------------------------
+local function textEconomyFacts(inst, text)
+	if #text == 0 or #text > 90 or not text:find("%d") then return nil end
+	local tok, names = ancestorTokens(inst, 3)
+	local low = text:lower()
+	local ctxCur = hit(tok, KW.currency)
+	local word = hasCurrencyWord(low)
+	local isPrice = text:find("%$") ~= nil or hit(tok, KW.price) ~= nil
+	local mult = text:match("%f[%a][xX]%s*(%d[%d%.,]*)") or text:match("(%d[%d%.,]*)%s*[xX]%f[%A]")
+	if not (ctxCur or word or isPrice or (mult and hit(tok, KW.mult))) then return nil end
+	local kind = (mult and hit(tok, KW.mult)) and "multiplier_text" or (isPrice and "price_text" or "currency_text")
+	return {
+		kind = kind, text = trunc(text), parsed_number = parseNumber(text) or NO,
+		multiplier = mult and tonumber((mult:gsub(",", ""))) or NO,
+		currency_hint = word or ctxCur or NO, path = path(inst), ui_context = L(names),
+	}
+end
+
+function Economy.onText(inst, text)
+	local P = textEconomyFacts(inst, text)
+	if P then Store.upsert("economy", inst, inst.Name, P, "gui_text:" .. P.path, "medium") end
+end
+
+function Economy.scanAttrs(inst, ctx, only)
+	local a = ctx and ctx:attrs() or Util.attrs(inst)
+	if next(a) == nil then return end
+	for k, v in pairs(a) do
+		if (only == nil or only == k) and hit(Tok.of(k), KW.econ) then
+			local r = Store.upsert("economy", "a:" .. Util.uid(inst) .. ":" .. k, k,
+				{ kind = "attribute", value = v, owner_path = path(inst), owner_class = inst.ClassName, attribute = k },
+				"attribute:" .. path(inst) .. "#" .. k, "high")
+			if r then Watch.ensureAttr(inst) end
+		end
+	end
+end
+
+addModule("economy", function(inst, ctx)
+	if ctx.rootTag == "playergui" then
+		if ctx.isText then
+			local t = get(inst, "Text")
+			if type(t) == "string" then Economy.onText(inst, t) end
+		end
+		return
+	end
+	if inst:IsA("ValueBase") then
+		local inLeader = ctx.parent and ctx.parent.Name == "leaderstats"
+		if hit(ctx.nameTok, KW.econ) or (inLeader and hit(ctx.nameTok, KW.currency)) then
+			local r = Store.upsert("economy", inst, inst.Name, { kind = inLeader and "leaderstats_value" or "value_object", value = plain(get(inst, "Value")),
+				value_class = ctx.cls, path = ctx:path() }, "value_object:" .. ctx:path(), "high")
+			if r then Watch.ensureValue(inst) end
+		end
+	end
+	Economy.scanAttrs(inst, ctx, nil)
+end)
+
+local function textProgressionFacts(inst, text)
+	if #text == 0 or #text > 90 or not (text:find("%d")) then return nil end
+	local tok, names = ancestorTokens(inst, 3)
+	local low = text:lower()
+	local kwHit = hit(tok, KW.prog)
+	local lowHit = low:find("level") or low:find("rebirth") or low:find("require") or low:find("unlock") or low:find("stage") or low:find("rank") or low:find("xp%f[%A]")
+	if not (kwHit or lowHit) then return nil end
+	local kind = "progress_text"
+	if low:find("require") or low:find("unlock") or low:find("need") then kind = "requirement_text" end
+	local P = { kind = kind, text = trunc(text), path = path(inst), ui_context = L(names), parsed_number = parseNumber(text) or NO }
+	local a, b = text:match("(%d[%d,%.]*%a*)%s*/%s*(%d[%d,%.]*%a*)")
+	if a and b then P.fraction = { current = parseNumber(a) or NO, max = parseNumber(b) or NO } end
+	return P
+end
+
+function Progression.onText(inst, text)
+	local P = textProgressionFacts(inst, text)
+	if P then Store.upsert("progression", inst, inst.Name, P, "gui_text:" .. P.path, "medium") end
+end
+
+function Progression.scanAttrs(inst, ctx, only)
+	local a = ctx and ctx:attrs() or Util.attrs(inst)
+	if next(a) == nil then return end
+	for k, v in pairs(a) do
+		if only == nil or only == k then
+			local tok = Tok.of(k)
+			if hit(tok, KW.prog) or hit(tok, KW.world) then
+				local r = Store.upsert("progression", "a:" .. Util.uid(inst) .. ":" .. k, k,
+					{ kind = "attribute", value = v, owner_path = path(inst), owner_class = inst.ClassName, attribute = k },
+					"attribute:" .. path(inst) .. "#" .. k, "high")
+				if r then Watch.ensureAttr(inst) end
+			end
+		end
+	end
+end
+
+addModule("progression", function(inst, ctx)
+	if ctx.rootTag == "playergui" then
+		if ctx.isText then
+			local t = get(inst, "Text")
+			if type(t) == "string" then Progression.onText(inst, t) end
+		end
+		return
+	end
+	if inst:IsA("ValueBase") then
+		local inLeader = ctx.parent and ctx.parent.Name == "leaderstats"
+		local isEcon = hit(ctx.nameTok, KW.econ) ~= nil
+		if (hit(ctx.nameTok, KW.prog) or hit(ctx.nameTok, KW.world) or (inLeader and not isEcon)) then
+			local r = Store.upsert("progression", inst, inst.Name, { kind = inLeader and "leaderstats_value" or "value_object", value = plain(get(inst, "Value")),
+				value_class = ctx.cls, path = ctx:path() }, "value_object:" .. ctx:path(), "high")
+			if r then Watch.ensureValue(inst) end
+		end
+	end
+	Progression.scanAttrs(inst, ctx, nil)
+end)
+
+------------------------------------------------------------------------------------------------------
+-- H. INTERFACE
+------------------------------------------------------------------------------------------------------
+addModule("interface", function(inst, ctx)
+	if ctx.rootTag ~= "playergui" then return end
+	local isLayer = inst:IsA("LayerCollector")
+	if not (ctx.isGuiObj or isLayer) then return end
+	local P = { class = ctx.cls, path = ctx:path() }
+	if ctx.phase == "dynamic" then P.loaded_dynamically = true else P.loaded_dynamically = false end
+	if isLayer then
+		P.role_guess = "screen_gui"
+		P.enabled = get(inst, "Enabled")
+		P.display_order = get(inst, "DisplayOrder")
+		P.reset_on_spawn = get(inst, "ResetOnSpawn")
+	else
+		P.visible = get(inst, "Visible")
+		P.effective_visible = Hooks.effectiveVisible(inst)
+		P.position = plain(get(inst, "Position"))
+		P.size = plain(get(inst, "Size"))
+		P.absolute_position = plain(get(inst, "AbsolutePosition"))
+		P.absolute_size = plain(get(inst, "AbsoluteSize"))
+		P.z_index = get(inst, "ZIndex")
+		P.layout_order = get(inst, "LayoutOrder")
+		P.background_color = plain(get(inst, "BackgroundColor3"))
+		P.background_transparency = plain(get(inst, "BackgroundTransparency"))
+		local role = "frame"
+		if inst:IsA("GuiButton") then role = "button"
+		elseif ctx.isText then role = "text"
+		elseif inst:IsA("ImageLabel") then role = "image"
+		elseif inst:IsA("ScrollingFrame") then role = "scroll" end
+		P.role_guess = role
+		if ctx.isText then
+			P.text = trunc(tostring(get(inst, "Text") or ""))
+			P.text_color = plain(get(inst, "TextColor3"))
+		end
+		if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+			P.image = plain(get(inst, "Image"))
+			P.image_color = plain(get(inst, "ImageColor3"))
+		end
+		if role == "button" and hit(ctx.nameTok, KW.tab) then P.tab_guess = true end
+		if hit(ctx.nameTok, KW.menu) then P.menu_guess = hit(ctx.nameTok, KW.menu) end
+	end
+	local a = ctx:attrs()
+	if next(a) ~= nil then P.attributes = a end
+	local rec = Store.upsert("ui", inst, inst.Name, P, "client_instance:" .. P.path .. " (" .. ctx.phase .. ")", "high")
+	if rec then Watch.ui(inst, rec, ctx) end
+end)
+
+------------------------------------------------------------------------------------------------------
+-- INVENTORY
+------------------------------------------------------------------------------------------------------
+function Inventory.refresh()
+	if not Session.alive then return end
+	local gen = Session.gen
+	local count = 0
+	local function rec(key, name, P, src, conf)
+		local r = Store.upsert("inventory", key, name, P, src, conf)
+		if r then count = count + 1 end
+		return r
+	end
+
+	local function tool(t, where)
+		local P = {
+			kind = "tool", class = t.ClassName, location = where, path = path(t), equipped = (where == "character"),
+			tooltip = trunc(tostring(get(t, "ToolTip") or "")), attributes = Util.attrs(t), value_children = Util.valueChildren(t),
+		}
+		rec(t, t.Name, P, "client_instance:" .. P.path, "high")
+	end
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if bp then
+		for _, t in ipairs(bp:GetChildren()) do
+			if t:IsA("Tool") then tool(t, "backpack") end
+		end
+	end
+	local ch = LocalPlayer.Character
+	if ch then
+		for _, t in ipairs(ch:GetChildren()) do
+			if t:IsA("Tool") then tool(t, "character") end
+		end
+	end
+
+	-- data folders / values under the local player and under ReplicatedStorage folders named after the local player
+	local nodes = 0
+	local function walkData(inst, where, depth)
+		if nodes >= 600 or depth > 5 then return end
+		local ok, kids = pcall(inst.GetChildren, inst)
+		if not ok then return end
+		for _, c in ipairs(kids) do
+			nodes = nodes + 1
+			if nodes >= 600 then return end
+			if c:IsA("ValueBase") then
+				local r = rec(c, c.Name, { kind = "player_data_value", location = where, value = plain(get(c, "Value")), value_class = c.ClassName,
+					path = path(c) }, "value_object:" .. path(c), "high")
+				if r then Watch.ensureValue(c) end
+			elseif c:IsA("Folder") or c:IsA("Configuration") then
+				local a = Util.attrs(c)
+				if next(a) ~= nil then
+					rec(c, c.Name, { kind = "player_data_folder", location = where, attributes = a, path = path(c), child_count = #c:GetChildren() },
+						"client_instance:" .. path(c), "high")
+				end
+				walkData(c, where, depth + 1)
+			end
+		end
+	end
+	for _, c in ipairs(LocalPlayer:GetChildren()) do
+		local n = c.Name
+		if not (c:IsA("Backpack") or c:IsA("PlayerGui") or n == "PlayerScripts" or n == "StarterGear" or n == "leaderstats") then
+			if c:IsA("Folder") or c:IsA("Configuration") or c:IsA("ValueBase") then
+				if c:IsA("ValueBase") then
+					rec(c, c.Name, { kind = "player_data_value", location = "player", value = plain(get(c, "Value")), path = path(c) }, "value_object:" .. path(c), "high")
+				else
+					walkData(c, "player", 1)
+				end
+			end
+		end
+	end
+	local function scanRS(parent, depth)
+		for _, c in ipairs(parent:GetChildren()) do
+			if c.Name == LocalPlayer.Name or c.Name == tostring(LocalPlayer.UserId) then
+				walkData(c, "replicated_storage_player_folder", 1)
+			elseif depth < 2 and (c:IsA("Folder") or c:IsA("Configuration")) then
+				scanRS(c, depth + 1)
+			end
+		end
+	end
+	pcall(scanRS, ReplicatedStorage, 0)
+
+	-- player attributes that look inventory-related
+	for k, v in pairs(Util.attrs(LocalPlayer)) do
+		local tok = Tok.of(k)
+		if hit(tok, KW.inv) or hit(tok, KW.pet) or hit(tok, KW.egg) or hit(tok, KW.weapon) or hit(tok, KW.box) then
+			rec("pa:" .. k, k, { kind = "player_attribute", value = v, path = path(LocalPlayer), attribute = k }, "attribute:" .. path(LocalPlayer) .. "#" .. k, "high")
+		end
+	end
+	Watch.ensureAttr(LocalPlayer)
+
+	-- visible inventory UI: slots and capacity texts
+	if PlayerGui then
+		local okd, desc = pcall(PlayerGui.GetDescendants, PlayerGui)
+		if okd then
+			local t0, scanned, slots = clock(), 0, 0
+			for _, d in ipairs(desc) do
+				if gen ~= Session.gen then return end
+				scanned = scanned + 1
+				if scanned > 6000 then
+					Store.note("inventory_ui_scan_cap", "Inventory UI scan stopped after 6000 GUI descendants.")
+					break
+				end
+				if d ~= Session.ownGui and (not Session.ownGui or not d:IsDescendantOf(Session.ownGui)) then
+					if d:IsA("TextLabel") or d:IsA("TextButton") then
+						local t = get(d, "Text")
+						if type(t) == "string" and #t <= 40 then
+							local cur, max = t:match("^%D*(%d+)%s*/%s*(%d+)%D*$")
+							if cur then
+								local tok = ancestorTokens(d, 4)
+								if hit(tok, KW.inv) or hit(tok, KW.pet) or hit(tok, KW.egg) or hit(tok, KW.weapon) then
+									rec(d, d.Name, { kind = "capacity_or_count_text", text = trunc(t), current = tonumber(cur), max = tonumber(max), path = path(d) },
+										"gui_text:" .. path(d), "low")
+								end
+							end
+						end
+					elseif (d:IsA("GuiButton") or d:IsA("Frame")) and slots < 600 then
+						local par = d.Parent
+						if par and (hit(Tok.of(par.Name), KW.invui) or (par.Parent and hit(Tok.of(par.Parent.Name), KW.invui))) then
+							local texts = collectTexts(d, 8)
+							if #texts > 0 then
+								local cnt = nil
+								for _, tx in ipairs(texts) do
+									cnt = tx:match("[xX]%s*(%d[%d,]*)") or tx:match("(%d[%d,]*)%s*[xX]%f[%A]")
+									if cnt then break end
+								end
+								slots = slots + 1
+								rec(d, d.Name, { kind = "ui_slot", texts = L(texts), count_text = cnt or NO, image = (d:IsA("ImageButton") and plain(get(d, "Image"))) or NO,
+									path = path(d), visible = get(d, "Visible") }, "client_instance:" .. path(d), "low")
+							end
+						end
+					end
+				end
+				if clock() - t0 > CONFIG.FRAME_BUDGET then task.wait(); t0 = clock() end
+			end
+		end
+	end
+
+	-- equipped pets seen as followers in the world (low confidence)
+	local followers = 0
+	for _, r in ipairs(Store.lists.pets) do
+		if r.properties.follows_local_player and not r.properties.removed_observed then followers = followers + 1 end
+	end
+	if followers > 0 then
+		rec("equipped_followers", "equipped_pet_followers_visible", { kind = "derived_count", count = followers,
+			basis = "pet models parented under a container named after the local player" }, "derived:pets", "low")
+	end
+	Log.info("Invent\u{E1}rio atualizado: " .. count .. " registros tocados.")
+end
+
+function Inventory.hook()
+	local function hookContainer(cont, where)
+		if not cont then return end
+		Watch.add(cont, "inv_added", cont.ChildAdded, function(c)
+			if c:IsA("Tool") then
+				Events.push(where == "character" and "tool_equipped" or "inventory_changed", c, nil, "ChildAdded", nil, c.Name, { noLimit = true, location = where })
+				Store.upsert("inventory", c, c.Name, { kind = "tool", class = c.ClassName, location = where, path = path(c), equipped = (where == "character"),
+					attributes = Util.attrs(c), value_children = Util.valueChildren(c) }, "client_instance:" .. path(c), "high")
+			end
+		end)
+		Watch.add(cont, "inv_removed", cont.ChildRemoved, function(c)
+			if c:IsA("Tool") then
+				Events.push(where == "character" and "tool_unequipped" or "inventory_changed", c, nil, "ChildRemoved", c.Name, nil, { noLimit = true, location = where })
+			end
+		end)
+	end
+	hookContainer(LocalPlayer:FindFirstChildOfClass("Backpack"), "backpack")
+	hookContainer(LocalPlayer.Character, "character")
+	Watch.add(LocalPlayer, "charadded", LocalPlayer.CharacterAdded, function(c)
+		hookContainer(c, "character")
+	end)
+end
+
+------------------------------------------------------------------------------------------------------
+-- WORLD TRACKING (position heuristic + player value changes handled by watchers)
+------------------------------------------------------------------------------------------------------
+World.current = nil
+function World.track()
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local okp, pos = pcall(rawGet, hrp, "Position")
+	if not okp then return end
+	local best, bestD, bestRec = nil, math.huge, nil
+	local checked = 0
+	for _, rec in ipairs(Store.lists.worlds) do
+		local P = rec.properties
+		if P.world_kind == "world" and P.root ~= "playergui" and not P.removed_observed and type(P.position) == "table" and type(P.position.x) == "number" then
+			checked = checked + 1
+			if checked > 400 then break end
+			local dx, dy, dz = pos.X - P.position.x, pos.Y - P.position.y, pos.Z - P.position.z
+			local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+			local sz = P.size
+			if type(sz) == "table" and type(sz.x) == "number" and abs(dx) <= sz.x / 2 and abs(dy) <= sz.y / 2 and abs(dz) <= sz.z / 2 then d = 0 end
+			if d < bestD then best, bestD, bestRec = rec.name, d, rec end
+		end
+	end
+	if best and best ~= World.current then
+		local old = World.current
+		World.current = best
+		Events.push("world_changed", nil, bestRec, "nearest_world_record", old, best,
+			{ distance_studs = bestD == math.huge and NULL or r2(bestD), basis = "distance_to_world_records_position_low_confidence", noLimit = true })
+	end
+end
+
+------------------------------------------------------------------------------------------------------
+-- VISIT / SCANNER / MONITOR
+------------------------------------------------------------------------------------------------------
+function Visit.node(inst, tag, phase)
+	if inst == Session.ownGui then return false end
+	if phase == "initial_scan" and Store.seen[inst] then return true end
+	Store.seen[inst] = true
+	local cls = inst.ClassName
+	local prune = false
+	if cls == "Model" then
+		local plr = Players:GetPlayerFromCharacter(inst)
+		if plr then
+			if plr ~= LocalPlayer then return false end
+			prune = true
+		end
+	end
+	if (cls == "Folder" or cls == "Model") and OtherPlayers[inst.Name] then return false end
+	if tag == "player" and inst == PlayerGui then return false end
+	local ctx = Ctx.make(inst, tag, phase)
+	Session.stats.visited = Session.stats.visited + 1
+	for _, m in ipairs(Modules) do
+		if not m.disabled then
+			local ok, err = pcall(m.visit, inst, ctx)
+			if not ok then
+				m.errors = m.errors + 1
+				Log.errOnce("mod:" .. m.name, "module " .. m.name .. ": " .. tostring(err))
+				if m.errors >= 50 then
+					m.disabled = true
+					Log.err("module " .. m.name .. " disabled after 50 errors")
+				end
+			end
+		end
+	end
+	return not prune
+end
+
+function Visit.dynamic(inst)
+	local tag = Roots.tagOf(inst)
+	if tag == "other" then return end
+	Visit.node(inst, tag, "dynamic")
+	local b = Store.byInstance[inst]
+	if b and active() then
+		for cat, r in pairs(b) do
+			if cat == "inventory" or cat == "economy" or cat == "progression" then
+				Events.push("object_added", inst, r, nil, nil, nil, { noLimit = true })
+				break
+			end
+		end
+	end
+end
+
+function Scanner.walk(root, tag, gen)
+	local S = Session
+	local stack, sp = {}, 0
+	local function push(inst, depth)
+		local ok, ch = pcall(inst.GetChildren, inst)
+		if ok and #ch > 0 then
+			if #ch > CONFIG.MAX_CHILDREN_PER_PARENT then
+				Store.note("children:" .. path(inst), "Only the first " .. CONFIG.MAX_CHILDREN_PER_PARENT .. " of " .. #ch .. " children of " .. path(inst) .. " were visited.")
+			end
+			sp = sp + 1
+			stack[sp] = { ch, 1, depth }
+		end
+	end
+	push(root, 1)
+	local t0 = clock()
+	while sp > 0 do
+		if gen ~= S.gen then return end
+		while S.state == "paused" do
+			task.wait(0.25)
+			if gen ~= S.gen then return end
+		end
+		local f = stack[sp]
+		local ch, i = f[1], f[2]
+		local lim = math.min(#ch, CONFIG.MAX_CHILDREN_PER_PARENT)
+		if i > lim then
+			stack[sp] = nil
+			sp = sp - 1
+		else
+			f[2] = i + 1
+			local inst = ch[i]
+			local ok, descend = pcall(Visit.node, inst, tag, "initial_scan")
+			if not ok then
+				Log.errOnce("visit", "visit error: " .. tostring(descend))
+				descend = true
+			end
+			if descend ~= false then
+				if f[3] < CONFIG.MAX_DEPTH then push(inst, f[3] + 1)
+				else Store.note("depth", "Maximum depth " .. CONFIG.MAX_DEPTH .. " reached; deeper descendants were not visited.") end
+			end
+			if clock() - t0 > CONFIG.FRAME_BUDGET then
+				task.wait()
+				t0 = clock()
+			end
+		end
+	end
+end
+
+function Scanner.run(gen)
+	local S = Session
+	S.stats.visited = 0
+	Structure.services()
+	local roots = Roots.list()
+	local total = 0
+	for _, r in ipairs(roots) do
+		local ok, n = pcall(function() return #r.inst:GetDescendants() end)
+		r.n = ok and n or 0
+		total = total + r.n + 1
+	end
+	S.stats.total = math.max(total, 1)
+	for _, r in ipairs(roots) do
+		if gen ~= S.gen then return end
+		Log.info("Escaneando " .. r.label .. " (~" .. r.n .. " objetos)")
+		if r.visitRoot then pcall(Visit.node, r.inst, r.tag, "initial_scan") end
+		Scanner.walk(r.inst, r.tag, gen)
+	end
+	if gen ~= S.gen then return end
+	pcall(Inventory.refresh)
+	pcall(World.track)
+	S.scanState = "complete"
+	S.tScanEnd = clock()
+	Log.info(string.format("Escaneamento inicial conclu\u{ED}do em %.1fs: %d registros. Monitorando mudan\u{E7}as.", S.tScanEnd - S.t0, Store.total()))
+end
+
+function Scanner.spawn()
+	local gen = Session.gen
+	task.spawn(function()
+		local ok, err = pcall(Scanner.run, gen)
+		if not ok then
+			Log.err("scan failed: " .. tostring(err))
+			if gen == Session.gen then Session.scanState = "error" end
+		end
+	end)
+end
+
+function Monitor.onRemoving(inst)
+	if Store.byInstance[inst] or Watch.conns[inst] then
+		Queue.removed[#Queue.removed + 1] = { inst, clock() }
+	end
+end
+
+function Monitor.processRemoved()
+	local q = Queue.removed
+	if #q == 0 then return end
+	local keep = {}
+	local now = clock()
+	for _, it in ipairs(q) do
+		if now - it[2] < 0.15 then
+			keep[#keep + 1] = it -- wait until the reparent (if any) has settled
+		else
+			local inst = it[1]
+			if not inst:IsDescendantOf(game) then
+				local recs = Store.byInstance[inst]
+				if recs then
+					local major
+					for cat, rec in pairs(recs) do
+						rec.properties.removed_observed = true
+						rec.properties.removed_at_session_seconds = r2(it[2] - Session.t0)
+						if cat == "boxes" then Boxes.onRemoved(rec, it[2]) end
+						if cat ~= "objects" and cat ~= "ui" and not major then major = rec end
+					end
+					if major then Events.push("object_removed", inst, major, nil, nil, nil, { noLimit = true }) end
+				end
+				Watch.drop(inst)
+			else
+				-- was only reparented inside the game: refresh path in item records, keep watching
+				local recs = Store.byInstance[inst]
+				if recs then
+					for _, rec in pairs(recs) do rec.properties.path = path(inst) end
+				end
+			end
+		end
+	end
+	Queue.removed = keep
+end
+
+function Monitor.step()
+	Monitor.processRemoved()
+	if active() then
+		Queue.process(CONFIG.FRAME_BUDGET)
+		local t = clock()
+		if t - (Monitor.lastWorld or 0) > 2 then
+			Monitor.lastWorld = t
+			World.track()
+		end
+	end
+end
+
+function Monitor.connect()
+	if Monitor.connected then return end
+	Monitor.connected = true
+	local g = Session.gen
+	local function conn(sig, fn)
+		local c = sig:Connect(fn)
+		Session.conns[#Session.conns + 1] = c
+	end
+	local function watchRoot(root)
+		conn(root.DescendantAdded, function(d)
+			if g == Session.gen then Queue.push(d) end
+		end)
+		conn(root.DescendantRemoving, function(d)
+			if g == Session.gen then Monitor.onRemoving(d) end
+		end)
+	end
+	watchRoot(Workspace)
+	watchRoot(ReplicatedStorage)
+	watchRoot(LocalPlayer) -- also covers PlayerGui, Backpack and leaderstats
+	conn(Players.PlayerAdded, function() refreshOtherPlayers() end)
+	conn(Players.PlayerRemoving, function() refreshOtherPlayers() end)
+	Inventory.hook()
+	task.spawn(function()
+		while Session.alive and g == Session.gen do
+			task.wait(0.15)
+			local ok, err = pcall(Monitor.step)
+			if not ok then Log.errOnce("monitor", "monitor step: " .. tostring(err)) end
+		end
+	end)
+end
+
+function Monitor.disconnect()
+	for _, c in ipairs(Session.conns) do pcall(function() c:Disconnect() end) end
+	Session.conns = {}
+	Monitor.connected = false
+end
+
+------------------------------------------------------------------------------------------------------
+-- 11. EXPORT
+------------------------------------------------------------------------------------------------------
+function FSapi.detect()
+	return {
+		writefile = type(writefile) == "function", readfile = type(readfile) == "function", isfile = type(isfile) == "function",
+		isfolder = type(isfolder) == "function", makefolder = type(makefolder) == "function", appendfile = type(appendfile) == "function",
+		setclipboard = type(setclipboard) == "function", identifyexecutor = type(identifyexecutor) == "function",
+	}
+end
+
+function FSapi.write(p, data)
+	if type(writefile) ~= "function" then return false, "writefile_unavailable" end
+	local ok, err = pcall(writefile, p, data)
+	if not ok then return false, tostring(err) end
+	if type(readfile) == "function" then
+		local ok2, back = pcall(readfile, p)
+		if not ok2 or type(back) ~= "string" then return true, "written_unverified" end
+		if #back == #data then return true, "verified" end
+		if #back >= #data * 0.95 then return true, "written_length_differs(" .. #back .. " vs " .. #data .. ")" end
+		return false, "verify_failed(read " .. #back .. " of " .. #data .. " chars)"
+	end
+	return true, "written_unverified"
+end
+
+local STATIC_LIMITS = {
+	{ "server_side_data", "Server-side data (DataStores, server Scripts, ServerStorage, ServerScriptService) is not replicated to the client and was not collected." },
+	{ "script_sources", "Script sources were never read; only name/class are listed." },
+	{ "hidden_probabilities", "Real drop tables and probabilities are only recorded when the game shows them in UI text, attributes or replicated values." },
+	{ "display_values", "Values are what the client displays or replicates; they may be rounded or abbreviated (1.2K) and can differ from server values." },
+	{ "heuristic_classification", "Records are classified by name tokens (box/egg/pet/weapon/world...). Names that do not contain those words are missed; some matches can be false positives. See per-record confidence." },
+	{ "streaming", "With StreamingEnabled only instances streamed to this client are visible; far-away areas are captured only if you walk there while monitoring is running." },
+	{ "other_players", "Other players' characters, per-player folders and data are excluded on purpose." },
+	{ "remotes", "RemoteEvents/RemoteFunctions are listed by name/class only and are never invoked, so server-driven results (rewards, hatch outcomes) are only seen when they show up in replicated state or UI." },
+	{ "timing_accuracy", "Times (lifetime, time-to-destroy) are measured by this client from the events it observes; replication latency and the first-observed moment limit their accuracy." },
+	{ "world_detection", "Current-world detection is a distance heuristic against world records (low confidence) plus player attribute/leaderstat changes when present." },
+	{ "event_rate_limit", "Observed events are rate limited per target/property and capped; record values still update, but not every intermediate change is stored." },
+	{ "noise_classes", "Decorative classes without attributes (Attachment, Weld, Decal, particle/light classes, UI layout helpers) are only counted, not listed." },
+	{ "delta_api", "File export depends on the executor's writefile/readfile/makefolder. Export capabilities detected at runtime are listed in metadata.export_capabilities." },
+}
+
+function Exporter.limitations()
+	local out = {}
+	local function add(name, text, conf)
+		out[#out + 1] = { id = string.format("lim_%03d", #out + 1), name = name, category = "limitations", properties = { description = text },
+			source = "collector", collected_at = Util.iso(), confidence = conf or "high" }
+	end
+	for _, l in ipairs(STATIC_LIMITS) do add(l[1], l[2]) end
+	for _, cat in ipairs(DATA_CATS) do
+		if Store.dropped[cat] > 0 then
+			add("record_cap_" .. cat, "Record cap reached for '" .. cat .. "': " .. Store.dropped[cat] .. " insert attempts were rejected (cap " .. (CONFIG.MAX_RECORDS[cat] or 2000) .. ").")
+		end
+	end
+	for _, k in ipairs(Store.noteOrder) do add("note", Store.notes[k]) end
+	if Queue.dropped > 0 then add("queue_overflow", Queue.dropped .. " DescendantAdded items were dropped because the queue was full.") end
+	if Watch.capHit then add("watcher_cap", "The cap of " .. CONFIG.MAX_WATCHERS .. " live watchers was reached; some objects are not monitored for changes.") end
+	if Events.muted > 0 or Events.skipped > 0 then add("events_rate_limited", Events.skipped .. " events skipped by rate limit, " .. Events.muted .. " keys muted after " .. CONFIG.EVENT_MAX_PER_KEY .. " events.") end
+	if Session.missed > 0 then add("missed_while_paused", Session.missed .. " change notifications arrived while paused/idle and were not recorded.") end
+	for _, m in ipairs(Modules) do
+		if m.disabled then add("module_disabled", "Module '" .. m.name .. "' was disabled after repeated errors.", "high") end
+	end
+	if Log.suppressed > 0 then add("suppressed_errors", Log.suppressed .. " repeated error messages were suppressed in the console.") end
+	if Session.scanState ~= "complete" then add("scan_incomplete", "Export taken while the initial scan state was '" .. Session.scanState .. "'; data may be partial.") end
+	if get(Workspace, "StreamingEnabled") == true then add("streaming_enabled_detected", "Workspace.StreamingEnabled is true in this place.") end
+	local n = 0
+	for _ in pairs(Store.noiseCounts) do n = n + 1 end
+	if n > 0 then add("noise_class_counts", Json.encode(Store.noiseCounts)) end
+	return out
+end
+
+local function finalizeRecord(rec)
+	return {
+		id = rec.id, name = rec.name, category = rec.category, properties = rec.properties, source = rec.source,
+		collected_at = rec.collected_at, last_updated_at = rec.last_updated_unix and Util.iso(rec.last_updated_unix) or nil,
+		confidence = rec.confidence,
+	}
+end
+
+local ORDER = { "worlds", "boxes", "weapons", "pets", "eggs", "economy", "progression", "inventory", "ui", "objects", "observed_events", "limitations" }
+
+local function composeDoc(metaStr, cats, sep)
+	local parts = { '{"metadata":', metaStr }
+	for _, c in ipairs(ORDER) do
+		local list = cats[c] or {}
+		parts[#parts + 1] = ',"' .. c .. '":['
+		if #list > 0 then
+			if sep == "\n" then parts[#parts + 1] = "\n" end
+			parts[#parts + 1] = table.concat(list, "," .. sep)
+			if sep == "\n" then parts[#parts + 1] = "\n" end
+		end
+		parts[#parts + 1] = "]"
+	end
+	parts[#parts + 1] = "}"
+	return table.concat(parts)
+end
+
+function Exporter.printFallback(label, data)
+	local n = math.ceil(#data / CONFIG.PRINT_CHUNK)
+	print(string.format("[UBRC] ===== BEGIN EXPORT %s (%d chars, %d chunks) =====", label, #data, n))
+	for i = 1, n do
+		local chunk = data:sub((i - 1) * CONFIG.PRINT_CHUNK + 1, i * CONFIG.PRINT_CHUNK)
+		print(string.format("UBRC|%s|%d/%d|%s", label, i, n, chunk))
+		if i % 20 == 0 then task.wait() end
+	end
+	print(string.format("[UBRC] ===== END EXPORT %s =====", label))
+end
+
+function Exporter._run()
+	local stamp = os.date("!%Y%m%d_%H%M%S")
+	local fsCaps = FSapi.detect()
+	local encoded, counts, failures = {}, {}, 0
+	local ly = clock()
+	for _, cat in ipairs(DATA_CATS) do
+		local snap = {}
+		for i, r in ipairs(Store.lists[cat]) do snap[i] = r end
+		if cat == "objects" then
+			local nz = 0
+			for _ in pairs(Store.noiseCounts) do nz = nz + 1 end
+			if nz > 0 then
+				snap[#snap + 1] = { id = "obj_noise_summary", name = "skipped_noise_class_counts", category = "objects", source = "collector", confidence = "high",
+					collected_at = Util.iso(), properties = { kind = "class_summary", counts = Store.noiseCounts, note = "counted, not listed" } }
+			end
+		end
+		local out = {}
+		for _, rec in ipairs(snap) do
+			local ok, s = pcall(function() return Json.encodeRecord(finalizeRecord(rec)) end)
+			if not ok then
+				failures = failures + 1
+				s = Json.encodeRecord({ id = rec.id, name = rec.name, category = cat, properties = { error = "serialization_failed" }, source = rec.source,
+					collected_at = rec.collected_at, confidence = "low" })
+			end
+			out[#out + 1] = s
+			if clock() - ly > 0.01 then task.wait(); ly = clock() end
+		end
+		encoded[cat] = out
+		counts[cat] = #out
+	end
+	local lims = Exporter.limitations()
+	if failures > 0 then
+		lims[#lims + 1] = { id = string.format("lim_%03d", #lims + 1), name = "serialization_failures", category = "limitations",
+			properties = { description = failures .. " records could not be serialized and were replaced by error stubs." }, source = "collector",
+			collected_at = Util.iso(), confidence = "high" }
+	end
+	local limStrs = {}
+	for _, l in ipairs(lims) do limStrs[#limStrs + 1] = Json.encodeRecord(l) end
+	encoded.limitations = limStrs
+	counts.limitations = #limStrs
+
+	local executor = NO
+	if type(identifyexecutor) == "function" then
+		local ok, a, b = pcall(identifyexecutor)
+		if ok then executor = tostring(a) .. (b and (" " .. tostring(b)) or "") end
+	end
+	local function metaFor(extra)
+		local m = {
+			game_name = "Unboxing Simulator", collector = "Unboxing Reference Collector", version = CONFIG.VERSION, timestamp = Util.iso(),
+			place_id = tostring(game.PlaceId), collection_scope = "client_observable",
+			game_id = tostring(game.GameId), place_name_observed = Session.placeName or NO, executor = executor,
+			session_state = Session.state, scan_state = Session.scanState,
+			scan_duration_seconds = Session.tScanEnd and r2(Session.tScanEnd - Session.t0) or NO,
+			streaming_enabled = get(Workspace, "StreamingEnabled") == true,
+			record_counts = counts, export_capabilities = fsCaps,
+		}
+		if extra then m.export_part = extra end
+		return Json.encode(m, { "game_name", "collector", "version", "timestamp", "place_id", "collection_scope" })
+	end
+
+	local total = 0
+	for _, c in ipairs(ORDER) do
+		for _, s in ipairs(encoded[c]) do total = total + #s + 2 end
+	end
+
+	local docs = {} -- { label, filename, compact(fn) }
+	if total <= CONFIG.SINGLE_FILE_MAX_CHARS then
+		docs[1] = { label = "full", file = "ubrc_" .. stamp .. ".json", cats = encoded, part = nil }
+	else
+		local parts = {}
+		for _, c in ipairs(ORDER) do
+			local cur, size = {}, 0
+			local list = encoded[c]
+			for _, s in ipairs(list) do
+				if size + #s > CONFIG.PART_MAX_CHARS and #cur > 0 then
+					parts[#parts + 1] = { cat = c, list = cur }
+					cur, size = {}, 0
+				end
+				cur[#cur + 1] = s
+				size = size + #s + 2
+			end
+			if #cur > 0 then parts[#parts + 1] = { cat = c, list = cur } end
+		end
+		for i, p in ipairs(parts) do
+			local cats = {}
+			cats[p.cat] = p.list
+			docs[#docs + 1] = {
+				label = string.format("p%02dof%02d_%s", i, #parts, p.cat),
+				file = string.format("ubrc_%s_p%02dof%02d_%s.json", stamp, i, #parts, p.cat),
+				cats = cats,
+				part = { index = i, count = #parts, category = p.cat, records_in_part = #p.list, total_in_category = counts[p.cat] },
+			}
+		end
+	end
+
+	-- write
+	local dir = CONFIG.EXPORT_DIR
+	local useDir = false
+	if fsCaps.writefile and fsCaps.makefolder and fsCaps.isfolder then
+		local okf, exists = pcall(isfolder, dir)
+		if okf and not exists then pcall(makefolder, dir) end
+		local okf2, exists2 = pcall(isfolder, dir)
+		useDir = okf2 and exists2 == true
+	end
+	local written, failed = {}, {}
+	local index = { files = {}, total_records = counts, created = Util.iso() }
+	for _, d in ipairs(docs) do
+		local data = composeDoc(metaFor(d.part), d.cats, "\n")
+		d.data = data
+		local fname = (useDir and (dir .. "/") or "") .. d.file
+		local ok, status = FSapi.write(fname, data)
+		if ok then
+			written[#written + 1] = fname
+			index.files[#index.files + 1] = { file = d.file, chars = #data, category = d.part and d.part.category or "all", status = status }
+			Log.info("Exportado: " .. fname .. " (" .. #data .. " chars, " .. status .. ")")
+		else
+			failed[#failed + 1] = d
+			Log.warn("Falha ao gravar " .. fname .. ": " .. tostring(status))
+		end
+		task.wait()
+	end
+	if #docs > 1 and #written > 0 then
+		local fname = (useDir and (dir .. "/") or "") .. "ubrc_" .. stamp .. "_index.json"
+		local ok, status = FSapi.write(fname, Json.encode(index))
+		if ok then Log.info("Exportado \u{ED}ndice: " .. fname) end
+	end
+
+	-- console fallback for anything that could not be written (never truncated silently)
+	if #failed > 0 then
+		Log.warn("Gravacao de arquivo indisponivel/falhou: imprimindo " .. #failed .. " parte(s) no console, em partes.")
+		for _, d in ipairs(failed) do
+			local compact = composeDoc(metaFor(d.part), d.cats, "")
+			Exporter.printFallback(d.label, compact)
+		end
+		Log.warn("Console: linhas 'UBRC|<parte>|i/n|<dados>'. Junte os dados na ordem e remova quebras de linha (veja README).")
+		if #failed == 1 and type(setclipboard) == "function" and #docs == 1 and #failed[1].data <= 1500000 then
+			local okc = pcall(setclipboard, failed[1].data)
+			if okc then Log.info("JSON completo copiado para a \u{E1}rea de transfer\u{EA}ncia.") end
+		end
+	end
+	Log.info(string.format("Exporta\u{E7}\u{E3}o conclu\u{ED}da: %d arquivo(s) gravado(s), %d via console.", #written, #failed))
+end
+
+function Exporter.run()
+	if Exporter.busy then
+		Log.warn("Exporta\u{E7}\u{E3}o j\u{E1} em andamento.")
+		return
+	end
+	Exporter.busy = true
+	local ok, err = pcall(Exporter._run)
+	Exporter.busy = false
+	if not ok then Log.err("Export failed: " .. tostring(err)) end
+end
+
+------------------------------------------------------------------------------------------------------
+-- 12. CONTROL + GUI
+------------------------------------------------------------------------------------------------------
+function Control.start()
+	if Session.state ~= "idle" then
+		Log.warn("Coleta j\u{E1} iniciada (estado: " .. Session.state .. ").")
+		return
+	end
+	Session.state = "running"
+	Session.scanState = "scanning"
+	Session.t0 = clock()
+	Session.tScanEnd = nil
+	Monitor.connect()
+	Scanner.spawn()
+	Log.info("Coleta iniciada.")
+end
+
+function Control.pause()
+	if Session.state == "running" then
+		Session.state = "paused"
+		Log.info("Pausado.")
+	else
+		Log.warn("Nada para pausar.")
+	end
+end
+
+function Control.resume()
+	if Session.state == "paused" then
+		Session.state = "running"
+		Log.info("Retomado.")
+	else
+		Log.warn("Nada para retomar.")
+	end
+end
+
+function Control.refreshInventory()
+	if Session.state == "idle" then
+		Log.warn("Inicie a coleta antes de atualizar o invent\u{E1}rio.")
+		return
+	end
+	task.spawn(function()
+		local ok, err = pcall(Inventory.refresh)
+		if not ok then Log.err("inventory: " .. tostring(err)) end
+	end)
+end
+
+function Control.export()
+	task.spawn(Exporter.run)
+end
+
+function Control.clear()
+	Session.gen = Session.gen + 1
+	Watch.dropAll()
+	Monitor.disconnect()
+	Queue.reset()
+	Queue.dropped = 0
+	Store.reset()
+	Events.reset()
+	World.current = nil
+	Session.state = "idle"
+	Session.scanState = "idle"
+	Session.missed = 0
+	Session.stats = { visited = 0, total = 1 }
+	for _, m in ipairs(Modules) do m.errors = 0; m.disabled = false end
+	Log.once, Log.suppressed = {}, 0
+	Log.info("Dados limpos. Pressione INICIAR COLETA para recome\u{E7}ar.")
+end
+
+local TABS = {
+	{ "Console", "console" }, { "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
+	{ "Pets", "pets" }, { "Ovos", "eggs" }, { "Economia", "economy" }, { "Progress\u{E3}o", "progression" },
+	{ "Invent\u{E1}rio", "inventory" }, { "Interface", "ui" }, { "Eventos", "observed_events" },
+}
+local SUMMARY_KEYS = {
+	boxes = { "health_current", "health_max", "world_kind" }, weapons = { "damage", "rarity", "attack_speed" }, pets = { "rarity", "category" },
+	eggs = { "price", "currency" }, worlds = { "world_kind", "unlock_requirements" }, economy = { "kind", "value", "text" },
+	progression = { "kind", "value", "text" }, inventory = { "kind", "count_text", "value", "location" },
+	ui = { "class", "text", "visible" }, objects = { "class", "kind" }, observed_events = { "event", "property", "old_value", "new_value" },
+}
+
+local function shortVal(v)
+	local t = type(v)
+	if t == "table" then return "{..}" end
+	local s = tostring(v)
+	if #s > 40 then s = s:sub(1, 37) .. "..." end
+	return s
+end
+
+function GUI.lineFor(cat, rec)
+	local P = rec.properties
+	local bits = {}
+	for _, k in ipairs(SUMMARY_KEYS[cat] or {}) do
+		local v = P[k]
+		if v ~= nil and v ~= NO and v ~= NULL then bits[#bits + 1] = k .. "=" .. shortVal(v) end
+	end
+	local nm = rec.name
+	if #nm > 32 then nm = nm:sub(1, 29) .. "..." end
+	return string.format("%s %s | %s | %s", rec.id, nm, rec.confidence, table.concat(bits, " "))
+end
+
+function GUI.render()
+	local g = GUI.refs
+	if not g or not g.main.Visible then return end
+	local S = Session
+	local total = Store.total()
+	local filled = Store.filled()
+	local pct = 0
+	if S.scanState == "complete" then pct = 1 elseif S.scanState == "scanning" then pct = math.min(S.stats.visited / math.max(S.stats.total, 1), 0.99) end
+	g.fill.Size = UDim2.new(pct, 0, 1, 0)
+	local phase = S.scanState == "complete" and "monitorando" or (S.scanState == "scanning" and "escaneando" or S.scanState)
+	g.progress.Text = string.format("%s %d%%  (estado: %s)", phase, floor(pct * 100), S.state)
+	g.stats.Text = string.format("Objetos registrados: %d | Categorias preenchidas: %d/%d | Eventos: %d | Watchers: %d", total, filled, #DATA_CATS,
+		#Store.lists.observed_events, Watch.count)
+	local lines = {}
+	if GUI.tab == "console" then
+		local from = math.max(1, #Log.lines - 80)
+		for i = from, #Log.lines do lines[#lines + 1] = Log.lines[i] end
+	else
+		local list = Store.lists[GUI.tab]
+		lines[1] = string.format("%d registros (mostrando os %d mais recentes)", #list, math.min(#list, 70))
+		for i = #list, math.max(1, #list - 69), -1 do lines[#lines + 1] = GUI.lineFor(GUI.tab, list[i]) end
+	end
+	local text = table.concat(lines, "\n")
+	if #text > 15000 then text = text:sub(1, 15000) end
+	g.body.Text = text
+end
+
+function GUI.build()
+	local parentGui
+	local okh, hui = pcall(function() return type(gethui) == "function" and gethui() or nil end)
+	if okh and hui then parentGui = hui end
+	if not parentGui then
+		local okc, cg = pcall(function() return game:GetService("CoreGui") end)
+		if okc then parentGui = cg end
+	end
+	if not parentGui then parentGui = PlayerGui end
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "UBRC_" .. tostring(math.random(1000, 9999))
+	sg.ResetOnSpawn = false
+	sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	sg.DisplayOrder = 999
+	local okp = pcall(function() sg.Parent = parentGui end)
+	if not okp or not sg.Parent then sg.Parent = PlayerGui end
+	Session.ownGui = sg
+
+	local function mk(class, props, parent)
+		local i = Instance.new(class)
+		for k, v in pairs(props) do i[k] = v end
+		i.Parent = parent
+		return i
+	end
+	local BG, PANEL, ACC = Color3.fromRGB(24, 26, 33), Color3.fromRGB(36, 39, 50), Color3.fromRGB(70, 110, 200)
+
+	local main = mk("Frame", { Size = UDim2.fromOffset(430, 400), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = BG, BorderSizePixel = 0 }, sg)
+	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
+	local title = mk("TextLabel", { Size = UDim2.new(1, -60, 0, 28), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "  Unboxing Reference Collector v" .. CONFIG.VERSION,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, main)
+	local body = mk("Frame", { Position = UDim2.fromOffset(0, 28), Size = UDim2.new(1, 0, 1, -28), BackgroundTransparency = 1 }, main)
+	local function mkBtn(text, x, y, w, parent, cb)
+		local b = mk("TextButton", { Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, 26), BackgroundColor3 = ACC, BorderSizePixel = 0, Text = text,
+			TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 11, AutoButtonColor = true }, parent)
+		mk("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+		Session.guiConns[#Session.guiConns + 1] = b.MouseButton1Click:Connect(function()
+			local ok, err = pcall(cb)
+			if not ok then Log.err(tostring(err)) end
+		end)
+		return b
+	end
+	local min = mkBtn("-", 370, 1, 28, main, function() body.Visible = not body.Visible; main.Size = body.Visible and UDim2.fromOffset(430, 400) or UDim2.fromOffset(430, 28) end)
+	local close = mkBtn("X", 400, 1, 28, main, function() ENV.UBRC_INSTANCE.Destroy() end)
+	min.Position = UDim2.new(1, -60, 0, 1); close.Position = UDim2.new(1, -30, 0, 1)
+	min.Size = UDim2.fromOffset(28, 26); close.Size = UDim2.fromOffset(28, 26)
+	min.Parent = main; close.Parent = main
+
+	mkBtn("INICIAR COLETA", 8, 6, 132, body, Control.start)
+	mkBtn("PAUSAR", 149, 6, 132, body, Control.pause)
+	mkBtn("RETOMAR", 290, 6, 132, body, Control.resume)
+	mkBtn("EXPORTAR JSON", 8, 36, 132, body, Control.export)
+	mkBtn("ATUALIZAR INVENT\u{C1}RIO", 149, 36, 132, body, Control.refreshInventory)
+	mkBtn("LIMPAR DADOS", 290, 36, 132, body, Control.clear)
+
+	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 68), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
+	local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(80, 180, 120), BorderSizePixel = 0 }, barBg)
+	local progress = mk("TextLabel", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "ocioso", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.Gotham, TextSize = 11, ZIndex = 2 }, barBg)
+	local stats = mk("TextLabel", { Position = UDim2.fromOffset(8, 88), Size = UDim2.new(1, -16, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(200, 205, 220),
+		Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, body)
+
+	local tabBar = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 118), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.X, ScrollingDirection = Enum.ScrollingDirection.X }, body)
+	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabBar)
+
+	local scroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 152), Size = UDim2.new(1, -16, 1, -160), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, body)
+	local text = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
+		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, scroll)
+
+	GUI.tab = "console"
+	local tabButtons = {}
+	for _, t in ipairs(TABS) do
+		local b = mk("TextButton", { Size = UDim2.fromOffset(#t[1] * 7 + 18, 26), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = t[1], TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.Gotham, TextSize = 11 }, tabBar)
+		mk("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+		tabButtons[t[2]] = b
+		Session.guiConns[#Session.guiConns + 1] = b.MouseButton1Click:Connect(function()
+			GUI.tab = t[2]
+			for k, btn in pairs(tabButtons) do btn.BackgroundColor3 = (k == GUI.tab) and ACC or PANEL end
+			GUI.render()
+		end)
+	end
+	tabButtons.console.BackgroundColor3 = ACC
+
+	-- dragging (mouse + touch)
+	local dragging, dragStart, startPos
+	Session.guiConns[#Session.guiConns + 1] = title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, main.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	Session.guiConns[#Session.guiConns + 1] = UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+
+	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats }
+end
+
+function GUI.loop()
+	task.spawn(function()
+		while Session.alive do
+			task.wait(0.6)
+			local ok, err = pcall(GUI.render)
+			if not ok then Log.errOnce("gui", "gui render: " .. tostring(err)) end
+		end
+	end)
+end
+
+------------------------------------------------------------------------------------------------------
+-- 13. MAIN
+------------------------------------------------------------------------------------------------------
+local function Destroy()
+	Session.alive = false
+	Session.gen = Session.gen + 1
+	pcall(Watch.dropAll)
+	pcall(Monitor.disconnect)
+	for _, c in ipairs(Session.guiConns) do pcall(function() c:Disconnect() end) end
+	Session.guiConns = {}
+	if GUI.refs and GUI.refs.gui then pcall(function() GUI.refs.gui:Destroy() end) end
+	GUI.refs = nil
+	if ENV.UBRC_INSTANCE and ENV.UBRC_INSTANCE.Session == Session then ENV.UBRC_INSTANCE = nil end
+end
+
+ENV.UBRC_INSTANCE = { Destroy = Destroy, Session = Session, Store = Store, Json = Json, Control = Control, Config = CONFIG }
+
+local okST, msgST = Json.selfTest()
+GUI.build()
+GUI.loop()
+Log.info("Unboxing Reference Collector v" .. CONFIG.VERSION .. " pronto. Escopo: somente leitura, dados observ\u{E1}veis pelo cliente.")
+Log.info("JSON self-test: " .. (okST and "ok" or ("FALHOU - " .. tostring(msgST))))
 do
-    local ok, result = pcall(function()
-        local source = game:HttpGet("https://sirius.menu/rayfield", true)
-        local fn = loadstring(source)
-        return fn()
-    end)
-    if ok and result then
-        Rayfield = result
-    else
-        warn("Falha ao carregar Rayfield:", result)
-        return
-    end
+	local caps = FSapi.detect()
+	Log.info(string.format("Arquivos: writefile=%s readfile=%s makefolder=%s isfolder=%s", tostring(caps.writefile), tostring(caps.readfile),
+		tostring(caps.makefolder), tostring(caps.isfolder)))
+	if not caps.writefile then Log.warn("writefile indispon\u{ED}vel: a exporta\u{E7}\u{E3}o ser\u{E1} impressa no console em partes.") end
 end
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local Lighting = game:GetService("Lighting")
-local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
-local CoreGui = game:GetService("CoreGui")
-
-local player = Players.LocalPlayer
-local RE = ReplicatedStorage:WaitForChild("RE")
-local RF = ReplicatedStorage:WaitForChild("RF")
-
-local PlayerData = require(ReplicatedStorage.Modules.PlayerData)
-local ItemData = require(ReplicatedStorage.Shared.ItemData)
-local Clock = require(ReplicatedStorage.Shared.Clock)
-local BoxController = require(ReplicatedStorage.Controllers.BoxController)
-local StateUtil = require(ReplicatedStorage.Shared.StateUtil)
-
-local I = {
-    box = utf8.char(0x1F4E6),
-    gift = utf8.char(0x1F381),
-    event = utf8.char(0x1F389),
-    money = utf8.char(0x1F4B0),
-    shield = utf8.char(0x1F6E1),
-    attack = utf8.char(0x2694),
-    sell = utf8.char(0x1F4B8),
-    map = utf8.char(0x1F5FA),
-    wheel = utf8.char(0x1F3A1),
-    bell = utf8.char(0x1F514),
-    stats = utf8.char(0x1F4CA),
-    eye = utf8.char(0x1F441),
-    gear = utf8.char(0x2699),
-    star = utf8.char(0x2B50),
-    egg = utf8.char(0x1F95A),
-    hat = utf8.char(0x1F3A9),
-    pet = utf8.char(0x1F43E),
-    check = utf8.char(0x2705),
-    x = utf8.char(0x274C),
-    bomb = utf8.char(0x1F4A3),
-    save = utf8.char(0x1F4BE),
-}
-
-local State = {
-    autoGoldRush = false,
-    autoEasterRush = false,
-    autoClose = false,
-    autoCloseRushResults = false,
-    autoClaim = false,
-    autoBP = false,
-    autoDaily = false,
-    autoAch = false,
-    autoQuestClaim = false,
-    autoPerk = false,
-
-    autoSellHats = false,
-    autoSellPets = false,
-    autoSellPerks = false,
-
-    autoAttackBoxes = false,
-    autoWheel = false,
-    webhookEnabled = false,
-
-    camLock = false,
-    tpCamera = false,
-
-    autoEasterCrate = false,
-    autoBasicPerkCrate = false,
-    autoHatDropBoost = false,
-    autoComumEventPotion = false,
-    autoRareEventPotion = false,
-    autoEpicEventPotion = false,
-    autoLegendaryEventPotion = false,
-    autoGodlyEventPotion = false,
-    autoMythicEventPotion = false,
-    autoMoleBoost = false,
-    autoEventBooster = false,
-}
-
-local crateAmount = 1
-local autoRushWorld = 108
-local autoAttackDelay = 0.05
-local autoAttackRange = 65
-local autoSellDelay = 5
-
-local webhookUrl = ""
-local webhookDelayMinutes = 60
-local lastWebhookAt = os.clock()
-local kickWebhookSent = false
-
-local autoFavoriteRareDrops = true
-local autoFavoriteGoodPerks = true
-local perkFavoriteMinStat = 4.0
-
-local wheelDelay = 0.03
-local wheelBurst = 1
-local selectedWheelId = "Auto Detect"
-local lastWheelTick = 0
-
-local selectedSaveName = "Save1"
-local saveFolder = "UnboxingHub/Saves"
-
-local camConn
-local tpConn
-local areaConn
-local lockedCameraCenter
-
-local routePoints = {}
-local routeIndex = 1
-local routeRadius = 80
-local routeStep = 25
-
-local autoFarmArea = false
-local farmAreaIndex = 1
-local farmAreaRadius = 90
-local farmAreaStep = 28
-local farmAreaCenter
-local farmPoints = {}
-local farmPointIndex = 1
-
-local Stats = {
-    startedAt = os.clock(),
-    boxesBroken = 0,
-    itemsSold = 0,
-    hatsSold = 0,
-    petsSold = 0,
-    perksSold = 0,
-    rushesDone = 0,
-    rushesByName = {},
-    cratesOpened = 0,
-    cratesByName = {},
-    eggRainGained = 0,
-    bombRainGained = 0,
-    ticketsGained = 0,
-    merchantBought = 0,
-}
-
-local sellRarities = {
-    Hats = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
-    Pets = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false, Etherium = false, Celestial = false },
-    Perks = { Common = true, Rare = true, Epic = false, Legendary = false, Godly = false, Mythic = false },
-}
-
-local rarityAliases = {
-    Mythical = "Mythic",
-    Ethereal = "Etherium",
-    Ethereum = "Etherium",
-}
-
-local blur = Instance.new("BlurEffect")
-blur.Size = 0
-blur.Parent = Lighting
-
-local Window = Rayfield:CreateWindow({
-    Name = I.gift .. " Unboxing Hub V1",
-    LoadingTitle = I.box .. " Unboxing Hub",
-    LoadingSubtitle = "by DrSkrr",
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = "UnboxingHub",
-        FileName = "Config",
-    },
-    Discord = {
-        Enabled = true,
-        Invite = "myjsXgDEC3",
-        RememberJoins = true,
-    },
-    KeySystem = false,
-})
-
-local FarmTab = Window:CreateTab(I.box .. " Farm", 4483362458)
-local EventTab = Window:CreateTab(I.event .. " Event", 4483362458)
-local RewardsTab = Window:CreateTab(I.gift .. " Rewards", 4483362458)
-local CratesTab = Window:CreateTab(I.box .. " Crates", 4483362458)
-local AutoSellTab = Window:CreateTab(I.sell .. " Auto Sell", 4483362458)
-local AutoAttackTab = Window:CreateTab(I.attack .. " Auto Attack", 4483362458)
-local AreaFarmTab = Window:CreateTab(I.map .. " Area Farm", 4483362458)
-local WheelTab = Window:CreateTab(I.wheel .. " Wheel", 4483362458)
-local WebhookTab = Window:CreateTab(I.bell .. " Webhook", 4483362458)
-local StatsTab = Window:CreateTab(I.stats .. " Stats", 4483362458)
-local VisualTab = Window:CreateTab(I.eye .. " Visual", 4483362458)
-local OtherTab = Window:CreateTab(I.gear .. " Other", 4483362458)
-
-local function notify(title, content, duration)
-    pcall(function()
-        Rayfield:Notify({
-            Title = tostring(title),
-            Content = tostring(content),
-            Duration = duration or 3,
-            Image = 4483362458,
-        })
-    end)
+if CONFIG.FETCH_PLACE_NAME and MarketplaceService then
+	task.spawn(function()
+		local ok, info = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+		if ok and type(info) == "table" and info.Name then
+			Session.placeName = trunc(info.Name)
+			Log.info("Place: " .. Session.placeName)
+			if not Session.placeName:lower():find("unbox") then
+				Log.warn("O nome do place n\u{E3}o cont\u{E9}m 'unbox' - confirme que este \u{E9} o jogo desejado.")
+			end
+		end
+	end)
 end
-
-local function formatTime(seconds)
-    seconds = math.floor(seconds)
-    local h = math.floor(seconds / 3600)
-    local m = math.floor((seconds % 3600) / 60)
-    local s = seconds % 60
-    return string.format("%02d:%02d:%02d", h, m, s)
-end
-
-local function countDict(tbl)
-    local count = 0
-    for _ in pairs(tbl or {}) do
-        count = count + 1
-    end
-    return count
-end
-
-local function getItemData(invItem)
-    if not invItem or not invItem.ItemId then return nil end
-
-    local ok, data = pcall(function()
-        return ItemData.Get(invItem.ItemId)
-    end)
-
-    if ok then return data end
-    return nil
-end
-
-local function getRarityName(itemData)
-    if not itemData or not itemData.Rarity then return nil end
-
-    local ok, rarityName = pcall(function()
-        return ItemData.GetRawRarityName(itemData.Rarity)
-    end)
-
-    if ok then
-        return rarityAliases[rarityName] or rarityName
-    end
-
-    return nil
-end
-
-local function getBestPerkStat(invItem)
-    local best = 0
-
-    local allowedKeys = {
-        stat = true,
-        stats = true,
-        boost = true,
-        boosts = true,
-        multiplier = true,
-        multipliers = true,
-        amount = true,
-        value = true,
-        values = true,
-        percent = true,
-        percentage = true,
-        modifier = true,
-        modifiers = true,
-    }
-
-    local blockedKeys = {
-        id = true,
-        uid = true,
-        uniqueid = true,
-        itemid = true,
-        level = true,
-        xp = true,
-        exp = true,
-        time = true,
-        timestamp = true,
-        created = true,
-        equipped = true,
-        slot = true,
-        price = true,
-        cost = true,
-        seed = true,
-    }
-
-    local function keyAllowed(key)
-        key = string.lower(tostring(key or ""))
-
-        for blocked in pairs(blockedKeys) do
-            if key:find(blocked) then
-                return false
-            end
-        end
-
-        for allowed in pairs(allowedKeys) do
-            if key:find(allowed) then
-                return true
-            end
-        end
-
-        return false
-    end
-
-    local function scan(value, key)
-        if type(value) == "number" then
-            if keyAllowed(key) and value >= perkFavoriteMinStat and value <= 100 then
-                if value > best then best = value end
-            end
-        elseif type(value) == "table" then
-            for k, v in pairs(value) do
-                scan(v, k)
-            end
-        end
-    end
-
-    scan(invItem, "root")
-    return best
-end
-
-local function isRareDrop(invItem)
-    if not invItem then return false end
-    local txt = string.lower(tostring(invItem.ItemId or invItem.Id or invItem.Name or ""))
-
-    return txt:find("eggrain")
-        or txt:find("egg rain")
-        or txt:find("bombrain")
-        or txt:find("bomb rain")
-        or txt:find("bomb%-rain")
-end
-
-local function favoriteOrLockItem(category, uid)
-    pcall(function()
-        if RE:FindFirstChild("FavoriteItem") then
-            RE.FavoriteItem:FireServer(category, uid, true)
-        elseif RE:FindFirstChild("LockItem") then
-            RE.LockItem:FireServer(category, uid, true)
-        elseif RE:FindFirstChild("ToggleFavorite") then
-            RE.ToggleFavorite:FireServer(category, uid)
-        elseif RF:FindFirstChild("FavoriteItem") then
-            RF.FavoriteItem:InvokeServer(category, uid, true)
-        elseif RF:FindFirstChild("LockItem") then
-            RF.LockItem:InvokeServer(category, uid, true)
-        elseif RF:FindFirstChild("ToggleFavorite") then
-            RF.ToggleFavorite:InvokeServer(category, uid)
-        end
-    end)
-end
-
-local function shouldSellItem(invItem, category)
-    if not invItem then return false end
-    if invItem.IsEquipped or invItem.IsFavorite or invItem.Locked then return false end
-
-    local data = getItemData(invItem)
-    local rarity = getRarityName(data)
-
-    return rarity and sellRarities[category] and sellRarities[category][rarity] == true
-end
-
-local function protectSpecialItems()
-    local data = PlayerData.data
-    if not data then return end
-
-    for _, category in ipairs({ "Hats", "Pets", "Perks" }) do
-        local storage = data[category]
-
-        if storage then
-            for uid, invItem in pairs(storage) do
-                if autoFavoriteRareDrops and isRareDrop(invItem) then
-                    favoriteOrLockItem(category, uid)
-                    invItem.IsFavorite = true
-                    invItem.Locked = true
-                elseif category == "Perks" and autoFavoriteGoodPerks and getBestPerkStat(invItem) >= perkFavoriteMinStat then
-                    favoriteOrLockItem(category, uid)
-                    invItem.IsFavorite = true
-                    invItem.Locked = true
-                end
-            end
-        end
-    end
-end
-
-local function sellInventoryCategory(category)
-    local data = PlayerData.data
-    if not data then return end
-
-    local storage = data[category]
-    if not storage then return end
-
-    local list = {}
-
-    for uid, invItem in pairs(storage) do
-        local protected = false
-
-        if autoFavoriteRareDrops and isRareDrop(invItem) then
-            favoriteOrLockItem(category, uid)
-            invItem.IsFavorite = true
-            invItem.Locked = true
-            protected = true
-        end
-
-        if category == "Perks" and autoFavoriteGoodPerks and getBestPerkStat(invItem) >= perkFavoriteMinStat then
-            favoriteOrLockItem(category, uid)
-            invItem.IsFavorite = true
-            invItem.Locked = true
-            protected = true
-        end
-
-        if not protected and shouldSellItem(invItem, category) then
-            table.insert(list, uid)
-        end
-    end
-
-    if (category == "Hats" or category == "Pets") and #list >= countDict(storage) then
-        table.remove(list)
-    end
-
-    if #list <= 0 then return end
-
-    local ok, result = pcall(function()
-        return RF.SellItems:InvokeServer(list, category)
-    end)
-
-    if ok and result then
-        Stats.itemsSold = Stats.itemsSold + #list
-        if category == "Hats" then Stats.hatsSold = Stats.hatsSold + #list end
-        if category == "Pets" then Stats.petsSold = Stats.petsSold + #list end
-        if category == "Perks" then Stats.perksSold = Stats.perksSold + #list end
-        notify(I.check .. " Auto Sell", "Vendeu " .. tostring(#list) .. " " .. category, 2)
-    end
-end
-
-local function getNearestBox()
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-
-    local field = BoxController.GetCurrentField(root.Position)
-    if not field then return nil end
-
-    local nearest
-    local nearestDist = autoAttackRange
-    local boxes = field.VisibleBoxes or field.Boxes or {}
-
-    for _, box in pairs(boxes) do
-        if box and box.CFrame and box.Health and box.Damage then
-            if box.Health > box.Damage and not box.IsOpen then
-                local dist = (box.CFrame.Position - root.Position).Magnitude
-
-                if dist < nearestDist then
-                    nearest = box
-                    nearestDist = dist
-                end
-            end
-        end
-    end
-
-    return nearest
-end
-
-local function buildRoutePoints(center, radius, step)
-    local points = {}
-
-    for x = -radius, radius, step do
-        local row = {}
-
-        for z = -radius, radius, step do
-            if Vector3.new(x, 0, z).Magnitude <= radius then
-                table.insert(row, center + Vector3.new(x, 0, z))
-            end
-        end
-
-        if math.floor((x + radius) / step) % 2 == 1 then
-            local rev = {}
-            for i = #row, 1, -1 do
-                table.insert(rev, row[i])
-            end
-            row = rev
-        end
-
-        for _, point in ipairs(row) do
-            table.insert(points, point)
-        end
-    end
-
-    return points
-end
-
-local function getAreaModel(index)
-    local areas = workspace:FindFirstChild("Areas")
-    index = tonumber(index)
-    if not index then return nil end
-
-    local function matches(inst)
-        local name = tostring(inst.Name)
-        local lower = string.lower(name)
-
-        if name == tostring(index) then return true end
-        if name:match("^" .. tostring(index) .. "[_%-%s]") then return true end
-        if lower:find("area") and lower:find(tostring(index)) then return true end
-        if lower:find("world") and lower:find(tostring(index)) then return true end
-
-        for _, attr in ipairs({ "Id", "ID", "AreaId", "AreaID", "World", "WorldId", "WorldID", "Index" }) do
-            local ok, value = pcall(function()
-                return inst:GetAttribute(attr)
-            end)
-
-            if ok and tonumber(value) == index then
-                return true
-            end
-        end
-
-        return false
-    end
-
-    if areas then
-        for _, inst in ipairs(areas:GetChildren()) do
-            if matches(inst) then return inst end
-        end
-
-        for _, inst in ipairs(areas:GetDescendants()) do
-            if (inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("BasePart")) and matches(inst) then
-                return inst
-            end
-        end
-    end
-
-    for _, inst in ipairs(workspace:GetDescendants()) do
-        if (inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("BasePart")) and matches(inst) then
-            return inst
-        end
-    end
-
-    return nil
-end
-
-local function getModelCenter(model)
-    if not model then return nil end
-
-    if model:IsA("BasePart") then
-        return model.Position
-    end
-
-    for _, name in ipairs({ "Spawn", "Teleport", "Center", "Hitbox", "Field", "Zone", "Base", "Floor" }) do
-        local inst = model:FindFirstChild(name, true)
-
-        if inst and inst:IsA("BasePart") then
-            return inst.Position
-        end
-    end
-
-    local bestPart
-    local bestSize = 0
-
-    for _, inst in ipairs(model:GetDescendants()) do
-        if inst:IsA("BasePart") then
-            local size = inst.Size.X * inst.Size.Y * inst.Size.Z
-
-            if size > bestSize then
-                bestSize = size
-                bestPart = inst
-            end
-        end
-    end
-
-    if bestPart then return bestPart.Position end
-
-    local ok, cf = pcall(function()
-        return model:GetPivot()
-    end)
-
-    if ok and cf then return cf.Position end
-    return nil
-end
-
-local function startTPCameraRoute()
-    if tpConn then tpConn:Disconnect() tpConn = nil end
-
-    local char = player.Character or player.CharacterAdded:Wait()
-    local root = char:WaitForChild("HumanoidRootPart")
-
-    lockedCameraCenter = lockedCameraCenter or root.Position
-    routePoints = buildRoutePoints(lockedCameraCenter, routeRadius, routeStep)
-    routeIndex = 1
-
-    tpConn = RunService.Heartbeat:Connect(function()
-        if not State.tpCamera then return end
-
-        local c = player.Character
-        local r = c and c:FindFirstChild("HumanoidRootPart")
-        local h = c and c:FindFirstChildOfClass("Humanoid")
-        if not r or not h or #routePoints == 0 then return end
-
-        local target = routePoints[routeIndex]
-        local flatR = Vector3.new(r.Position.X, lockedCameraCenter.Y, r.Position.Z)
-        local flatT = Vector3.new(target.X, lockedCameraCenter.Y, target.Z)
-
-        if (flatR - flatT).Magnitude <= 8 then
-            routeIndex = routeIndex + 1
-            if routeIndex > #routePoints then routeIndex = 1 end
-            target = routePoints[routeIndex]
-        end
-
-        h:MoveTo(target)
-    end)
-end
-
-local function stopTPCameraRoute()
-    if tpConn then tpConn:Disconnect() tpConn = nil end
-end
-
-local function startFarmAreaRoute()
-    if areaConn then areaConn:Disconnect() areaConn = nil end
-
-    local area = getAreaModel(farmAreaIndex)
-    farmAreaCenter = getModelCenter(area)
-
-    if not farmAreaCenter then
-        notify(I.x .. " Area Farm", "Area nao encontrada: " .. tostring(farmAreaIndex), 3)
-        return
-    end
-
-    local char = player.Character or player.CharacterAdded:Wait()
-    local root = char:WaitForChild("HumanoidRootPart")
-    root.CFrame = CFrame.new(farmAreaCenter + Vector3.new(0, 4, 0))
-
-    farmPoints = buildRoutePoints(farmAreaCenter, farmAreaRadius, farmAreaStep)
-    farmPointIndex = 1
-    State.autoAttackBoxes = true
-
-    areaConn = RunService.Heartbeat:Connect(function()
-        if not autoFarmArea then return end
-
-        local c = player.Character
-        local r = c and c:FindFirstChild("HumanoidRootPart")
-        local h = c and c:FindFirstChildOfClass("Humanoid")
-        if not r or not h or #farmPoints == 0 then return end
-
-        local target = farmPoints[farmPointIndex]
-        local flatR = Vector3.new(r.Position.X, farmAreaCenter.Y, r.Position.Z)
-        local flatT = Vector3.new(target.X, farmAreaCenter.Y, target.Z)
-
-        if (flatR - flatT).Magnitude <= 8 then
-            farmPointIndex = farmPointIndex + 1
-            if farmPointIndex > #farmPoints then farmPointIndex = 1 end
-            target = farmPoints[farmPointIndex]
-        end
-
-        h:MoveTo(target)
-    end)
-
-    notify(I.check .. " Area Farm", "Farmando area " .. tostring(farmAreaIndex), 3)
-end
-
-local function stopFarmAreaRoute()
-    if areaConn then areaConn:Disconnect() areaConn = nil end
-end
-
-local function getEquippedPerkIds()
-    local data = PlayerData.data
-    local ids = {}
-    if not data then return ids end
-
-    if type(data.PerksEquipped) == "table" then
-        for _, id in pairs(data.PerksEquipped) do
-            if id then table.insert(ids, id) end
-        end
-    end
-
-    if type(data.EquippedPerks) == "table" then
-        for _, id in pairs(data.EquippedPerks) do
-            if id then table.insert(ids, id) end
-        end
-    end
-
-    if type(data.Perks) == "table" then
-        for uid, perk in pairs(data.Perks) do
-            if perk and (perk.IsEquipped or perk.Equipped or perk.Slot or perk.TeamIndex) then
-                table.insert(ids, uid)
-            end
-        end
-    end
-
-    return ids
-end
-
-local function forceActivateEquippedPerks()
-    for _, id in ipairs(getEquippedPerkIds()) do
-        pcall(function()
-            RE.ActivatePerk:FireServer(id)
-        end)
-        task.wait(0.15)
-    end
-end
-
-local function recordRush(name)
-    Stats.rushesDone = Stats.rushesDone + 1
-    Stats.rushesByName[name] = (Stats.rushesByName[name] or 0) + 1
-end
-
-local function trackCrateReward(value)
-    if type(value) == "string" then
-        local s = string.lower(value)
-
-        if s:find("eggrain") or s:find("egg rain") then Stats.eggRainGained = Stats.eggRainGained + 1 end
-        if s:find("bombrain") or s:find("bomb rain") or s:find("bomb%-rain") then Stats.bombRainGained = Stats.bombRainGained + 1 end
-        if s:find("ticket") then Stats.ticketsGained = Stats.ticketsGained + 1 end
-    elseif type(value) == "table" then
-        for k, v in pairs(value) do
-            local key = string.lower(tostring(k))
-
-            if key:find("ticket") and type(v) == "number" then
-                Stats.ticketsGained = Stats.ticketsGained + v
-            end
-
-            trackCrateReward(k)
-            trackCrateReward(v)
-        end
-    end
-end
-
-local function openCrateAndTrack(crateId, amount)
-    amount = tonumber(amount) or 1
-
-    local ok, result = pcall(function()
-        return RF.OpenCrate:InvokeServer(crateId, amount)
-    end)
-
-    if ok then
-        Stats.cratesOpened = Stats.cratesOpened + amount
-        Stats.cratesByName[crateId] = (Stats.cratesByName[crateId] or 0) + amount
-        trackCrateReward(result)
-    end
-end
-
-local function spinSelectedWheel()
-    local wheelId = selectedWheelId
-
-    if wheelId == "Auto Detect" then
-        for _, inst in ipairs(workspace:GetDescendants()) do
-            local ok, id = pcall(function()
-                return inst:GetAttribute("WheelId")
-            end)
-
-            if ok and id then
-                wheelId = id
-                break
-            end
-        end
-    end
-
-    if not wheelId then return end
-
-    pcall(function()
-        RF.SpinTicketWheel:InvokeServer(wheelId)
-    end)
-end
-
-local function claimDamageQuest()
-    pcall(function()
-        RE.CollectQuest:FireServer("Damage")
-    end)
-end
-
-local function sendWebhookForce(message)
-    if webhookUrl == "" then return end
-
-    local req = http_request or request or syn and syn.request or fluxus and fluxus.request
-    if not req then return end
-
-    pcall(function()
-        req({
-            Url = webhookUrl,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode({ content = tostring(message) }),
-        })
-    end)
-end
-
-local function sendWebhook(message)
-    if webhookUrl == "" then
-        notify(I.bell .. " Webhook", "Coloque a URL primeiro.", 3)
-        return
-    end
-
-    local req = http_request or request or syn and syn.request or fluxus and fluxus.request
-
-    if not req then
-        notify(I.x .. " Webhook", "Executor sem request/http_request.", 4)
-        return
-    end
-
-    sendWebhookForce(message)
-end
-
-local function buildWebhookReport()
-    local lines = {}
-
-    table.insert(lines, "Unboxing Hub - Relatorio")
-    table.insert(lines, "Player: " .. tostring(player.Name))
-    table.insert(lines, "Tempo: " .. formatTime(os.clock() - Stats.startedAt))
-    table.insert(lines, "Easter Rush: " .. tostring(Stats.rushesByName["Easter Rush"] or 0))
-    table.insert(lines, "Gold Rush: " .. tostring(Stats.rushesByName["Gold Rush"] or 0))
-    table.insert(lines, "Caixas quebradas: " .. tostring(Stats.boxesBroken))
-    table.insert(lines, "Crates abertas: " .. tostring(Stats.cratesOpened))
-    table.insert(lines, "EggRain: " .. tostring(Stats.eggRainGained))
-    table.insert(lines, "BombRain: " .. tostring(Stats.bombRainGained))
-    table.insert(lines, "Tickets: " .. tostring(Stats.ticketsGained))
-    table.insert(lines, "Merchant comprados: " .. tostring(Stats.merchantBought))
-    table.insert(lines, "Vendidos: " .. tostring(Stats.itemsSold))
-    table.insert(lines, "Hats vendidos: " .. tostring(Stats.hatsSold))
-    table.insert(lines, "Pets vendidos: " .. tostring(Stats.petsSold))
-    table.insert(lines, "Perks vendidos: " .. tostring(Stats.perksSold))
-    table.insert(lines, "Crates:")
-
-    local hasCrate = false
-
-    for crateName, count in pairs(Stats.cratesByName) do
-        hasCrate = true
-        table.insert(lines, "- " .. tostring(crateName) .. ": " .. tostring(count))
-    end
-
-    if not hasCrate then
-        table.insert(lines, "- nenhuma")
-    end
-
-    return table.concat(lines, "\n")
-end
-
-local function notifyKickWebhook(reason)
-    if kickWebhookSent then return end
-    kickWebhookSent = true
-
-    local lines = {}
-
-    table.insert(lines, "ALERTA: Player saiu/kickado do jogo")
-    table.insert(lines, "Player: " .. tostring(player.Name))
-    table.insert(lines, "UserId: " .. tostring(player.UserId))
-    table.insert(lines, "Motivo: " .. tostring(reason or "Desconhecido"))
-    table.insert(lines, "Tempo: " .. formatTime(os.clock() - Stats.startedAt))
-    table.insert(lines, "Caixas quebradas: " .. tostring(Stats.boxesBroken))
-    table.insert(lines, "Crates abertas: " .. tostring(Stats.cratesOpened))
-    table.insert(lines, "Itens vendidos: " .. tostring(Stats.itemsSold))
-
-    sendWebhookForce(table.concat(lines, "\n"))
-end
-
-local function safeFileName(name)
-    name = tostring(name or "Save1")
-    name = name:gsub("[^%w_%-%s]", "")
-    if name == "" then name = "Save1" end
-    return name
-end
-
-local function ensureSaveFolder()
-    if makefolder then
-        pcall(function()
-            if not isfolder("UnboxingHub") then makefolder("UnboxingHub") end
-            if not isfolder(saveFolder) then makefolder(saveFolder) end
-        end)
-    end
-end
-
-local function getSavePath(name)
-    return saveFolder .. "/" .. safeFileName(name) .. ".json"
-end
-
-local function buildSaveData()
-    return {
-        State = State,
-        sellRarities = sellRarities,
-        crateAmount = crateAmount,
-        autoRushWorld = autoRushWorld,
-        autoAttackDelay = autoAttackDelay,
-        autoSellDelay = autoSellDelay,
-        webhookUrl = webhookUrl,
-        webhookDelayMinutes = webhookDelayMinutes,
-        autoFavoriteRareDrops = autoFavoriteRareDrops,
-        autoFavoriteGoodPerks = autoFavoriteGoodPerks,
-        perkFavoriteMinStat = perkFavoriteMinStat,
-        wheelDelay = wheelDelay,
-        wheelBurst = wheelBurst,
-        selectedWheelId = selectedWheelId,
-        farmAreaIndex = farmAreaIndex,
-        farmAreaRadius = farmAreaRadius,
-        farmAreaStep = farmAreaStep,
-    }
-end
-
-local function applySaveData(data)
-    if type(data) ~= "table" then return end
-
-    if type(data.State) == "table" then
-        for k, v in pairs(data.State) do
-            if State[k] ~= nil then State[k] = v end
-        end
-    end
-
-    if type(data.sellRarities) == "table" then
-        for category, rarities in pairs(data.sellRarities) do
-            if sellRarities[category] and type(rarities) == "table" then
-                for rarity, value in pairs(rarities) do
-                    if sellRarities[category][rarity] ~= nil then
-                        sellRarities[category][rarity] = value
-                    end
-                end
-            end
-        end
-    end
-
-    crateAmount = tonumber(data.crateAmount) or crateAmount
-    autoRushWorld = tonumber(data.autoRushWorld) or autoRushWorld
-    autoAttackDelay = tonumber(data.autoAttackDelay) or autoAttackDelay
-    autoSellDelay = tonumber(data.autoSellDelay) or autoSellDelay
-    webhookUrl = tostring(data.webhookUrl or webhookUrl)
-    webhookDelayMinutes = tonumber(data.webhookDelayMinutes) or webhookDelayMinutes
-    autoFavoriteRareDrops = data.autoFavoriteRareDrops == true
-    autoFavoriteGoodPerks = data.autoFavoriteGoodPerks == true
-    perkFavoriteMinStat = tonumber(data.perkFavoriteMinStat) or perkFavoriteMinStat
-    wheelDelay = tonumber(data.wheelDelay) or wheelDelay
-    wheelBurst = tonumber(data.wheelBurst) or wheelBurst
-    selectedWheelId = tostring(data.selectedWheelId or selectedWheelId)
-    farmAreaIndex = tonumber(data.farmAreaIndex) or farmAreaIndex
-    farmAreaRadius = tonumber(data.farmAreaRadius) or farmAreaRadius
-    farmAreaStep = tonumber(data.farmAreaStep) or farmAreaStep
-end
-
-local function saveProfile(name)
-    if not writefile then
-        notify(I.save .. " Save", "Executor nao suporta writefile.", 4)
-        return
-    end
-
-    ensureSaveFolder()
-
-    local ok, err = pcall(function()
-        writefile(getSavePath(name), HttpService:JSONEncode(buildSaveData()))
-    end)
-
-    if ok then
-        notify(I.save .. " Save", "Config salva: " .. safeFileName(name), 3)
-    else
-        notify(I.x .. " Save", "Erro: " .. tostring(err), 4)
-    end
-end
-
-local function loadProfile(name)
-    if not readfile or not isfile then
-        notify(I.save .. " Save", "Executor nao suporta readfile/isfile.", 4)
-        return
-    end
-
-    local path = getSavePath(name)
-
-    if not isfile(path) then
-        notify(I.x .. " Save", "Nao encontrado: " .. safeFileName(name), 4)
-        return
-    end
-
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(readfile(path))
-    end)
-
-    if ok and type(data) == "table" then
-        applySaveData(data)
-        notify(I.check .. " Save", "Config carregada: " .. safeFileName(name), 3)
-    else
-        notify(I.x .. " Save", "Erro ao carregar.", 4)
-    end
-end
-
-pcall(function()
-    RE.BoxesDestroyed.OnClientEvent:Connect(function(_, boxBuffer)
-        local count = 0
-
-        pcall(function()
-            count = buffer.len(boxBuffer) // 2
-        end)
-
-        Stats.boxesBroken = Stats.boxesBroken + count
-    end)
-end)
-
-FarmTab:CreateSection(I.money .. " Farm")
-
-FarmTab:CreateInput({
-    Name = I.box .. " Mundo do Auto Gold Rush",
-    PlaceholderText = "Ex: 108",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n then autoRushWorld = n end
-    end,
-})
-
-FarmTab:CreateToggle({ Name = I.money .. " Auto Gold Rush", CurrentValue = false, Flag = "AutoGoldRush", Callback = function(v) State.autoGoldRush = v end })
-FarmTab:CreateToggle({ Name = I.egg .. " Auto Easter Rush", CurrentValue = false, Flag = "AutoEasterRush", Callback = function(v) State.autoEasterRush = v end })
-FarmTab:CreateToggle({ Name = I.x .. " Auto Close", CurrentValue = false, Flag = "AutoClose", Callback = function(v) State.autoClose = v end })
-FarmTab:CreateToggle({ Name = I.check .. " Auto Close Rush Results", CurrentValue = false, Flag = "AutoCloseRushResults", Callback = function(v) State.autoCloseRushResults = v end })
-FarmTab:CreateToggle({ Name = I.shield .. " NeverGlitch", CurrentValue = false, Flag = "NeverGlitch", Callback = function(v) State.autoPerk = v end })
-
-FarmTab:CreateButton({
-    Name = I.bomb .. " BOMB RAIN > NOT IS PERK",
-    Callback = function()
-        pcall(function()
-            RE.PromptProductPurchase:FireServer("BombRainInstant")
-        end)
-    end,
-})
-
-EventTab:CreateSection(I.event .. " Mole Merchant")
-
-EventTab:CreateToggle({ Name = I.egg .. " EasterCrate", CurrentValue = false, Flag = "EasterCrate", Callback = function(v) State.autoEasterCrate = v end })
-EventTab:CreateToggle({ Name = I.star .. " BasicPerkCrate", CurrentValue = false, Flag = "BasicPerkCrate", Callback = function(v) State.autoBasicPerkCrate = v end })
-EventTab:CreateToggle({ Name = I.hat .. " HatDropBoost", CurrentValue = false, Flag = "HatDropBoost", Callback = function(v) State.autoHatDropBoost = v end })
-EventTab:CreateToggle({ Name = "ComumEventPotion", CurrentValue = false, Flag = "ComumEventPotion", Callback = function(v) State.autoComumEventPotion = v end })
-EventTab:CreateToggle({ Name = "RareEventPotion", CurrentValue = false, Flag = "RareEventPotion", Callback = function(v) State.autoRareEventPotion = v end })
-EventTab:CreateToggle({ Name = "EpicEventPotion", CurrentValue = false, Flag = "EpicEventPotion", Callback = function(v) State.autoEpicEventPotion = v end })
-EventTab:CreateToggle({ Name = "LegendaryEventPotion", CurrentValue = false, Flag = "LegendaryEventPotion", Callback = function(v) State.autoLegendaryEventPotion = v end })
-EventTab:CreateToggle({ Name = "GodlyEventPotion", CurrentValue = false, Flag = "GodlyEventPotion", Callback = function(v) State.autoGodlyEventPotion = v end })
-EventTab:CreateToggle({ Name = "MythicEventPotion", CurrentValue = false, Flag = "MythicEventPotion", Callback = function(v) State.autoMythicEventPotion = v end })
-EventTab:CreateToggle({ Name = "MoleBoost", CurrentValue = false, Flag = "MoleBoost", Callback = function(v) State.autoMoleBoost = v end })
-EventTab:CreateToggle({ Name = "EventBooster", CurrentValue = false, Flag = "EventBooster", Callback = function(v) State.autoEventBooster = v end })
-
-RewardsTab:CreateSection(I.gift .. " Rewards")
-RewardsTab:CreateToggle({ Name = I.money .. " Auto Claim", CurrentValue = false, Flag = "AutoClaim", Callback = function(v) State.autoClaim = v end })
-RewardsTab:CreateToggle({ Name = I.attack .. " Battle Pass", CurrentValue = false, Flag = "BattlePass", Callback = function(v) State.autoBP = v end })
-RewardsTab:CreateToggle({ Name = I.gift .. " Daily Login", CurrentValue = false, Flag = "DailyLogin", Callback = function(v) State.autoDaily = v end })
-RewardsTab:CreateToggle({ Name = I.star .. " Achievements", CurrentValue = false, Flag = "Achievements", Callback = function(v) State.autoAch = v end })
-RewardsTab:CreateToggle({ Name = I.check .. " ClaimDamegeQuest", CurrentValue = false, Flag = "ClaimDamegeQuest", Callback = function(v) State.autoQuestClaim = v end })
-
-CratesTab:CreateSection(I.box .. " Crates")
-
-CratesTab:CreateInput({
-    Name = I.box .. " Quantidade",
-    PlaceholderText = "Ex: 10",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n > 0 then crateAmount = n else crateAmount = 1 end
-    end,
-})
-
-local function crateButton(name, crateId)
-    CratesTab:CreateButton({
-        Name = I.box .. " " .. name,
-        Callback = function()
-            openCrateAndTrack(crateId, crateAmount)
-        end,
-    })
-end
-
-crateButton("EasterCrate", "Easter2024Crate")
-crateButton("MaterialCrate", "MaterialCrate")
-crateButton("BasicPerk", "BasicPerkCrate")
-crateButton("BoxPerk", "BoxPerkCrate")
-crateButton("Alien DungeonCrateWorld3", "DungeonCrateWorld3")
-crateButton("CrystalCave DungeonCrateWorld1", "DungeonCrateWorld1")
-
-AutoSellTab:CreateSection(I.shield .. " Protecao")
-AutoSellTab:CreateToggle({ Name = I.bomb .. " Favoritar EggRain/BombRain", CurrentValue = true, Flag = "AutoFavoriteRareDrops", Callback = function(v) autoFavoriteRareDrops = v end })
-AutoSellTab:CreateToggle({ Name = I.star .. " Favoritar Perks bons", CurrentValue = true, Flag = "AutoFavoriteGoodPerks", Callback = function(v) autoFavoriteGoodPerks = v end })
-
-AutoSellTab:CreateInput({
-    Name = I.star .. " Stat minimo do Perk",
-    PlaceholderText = "Padrao: 4.0",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n then perkFavoriteMinStat = n end
-    end,
-})
-
-AutoSellTab:CreateInput({
-    Name = I.gear .. " Delay Auto Sell",
-    PlaceholderText = "Padrao: 5",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 1 then autoSellDelay = n end
-    end,
-})
-
-local rarityOrderDefault = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic", "Etherium", "Celestial" }
-local rarityOrderPerks = { "Common", "Rare", "Epic", "Legendary", "Godly", "Mythic" }
-
-local function rarityToggles(category, icon)
-    AutoSellTab:CreateSection(icon .. " Sell " .. category)
-
-    AutoSellTab:CreateToggle({
-        Name = I.sell .. " Ativar Auto Sell " .. category,
-        CurrentValue = false,
-        Flag = "AutoSell" .. category,
-        Callback = function(v)
-            State["autoSell" .. category] = v
-        end,
-    })
-
-    local order = category == "Perks" and rarityOrderPerks or rarityOrderDefault
-
-    for _, rarity in ipairs(order) do
-        AutoSellTab:CreateToggle({
-            Name = rarity,
-            CurrentValue = sellRarities[category][rarity],
-            Flag = "Sell" .. category .. rarity,
-            Callback = function(v)
-                sellRarities[category][rarity] = v
-            end,
-        })
-    end
-end
-
-rarityToggles("Hats", I.hat)
-rarityToggles("Pets", I.pet)
-rarityToggles("Perks", I.star)
-
-AutoSellTab:CreateButton({ Name = I.shield .. " Proteger Agora", Callback = function() protectSpecialItems() notify(I.check .. " Protecao", "Verificado.", 2) end })
-AutoSellTab:CreateButton({ Name = I.sell .. " Vender Agora", Callback = function() protectSpecialItems() sellInventoryCategory("Hats") sellInventoryCategory("Pets") sellInventoryCategory("Perks") end })
-
-AutoAttackTab:CreateSection(I.attack .. " Auto Attack")
-AutoAttackTab:CreateToggle({ Name = I.attack .. " Auto Attack Aura", CurrentValue = false, Flag = "AutoAttackBoxes", Callback = function(v) State.autoAttackBoxes = v end })
-
-AutoAttackTab:CreateInput({
-    Name = I.gear .. " Delay",
-    PlaceholderText = "Padrao: 0.05",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 0.01 then autoAttackDelay = n end
-    end,
-})
-
-AreaFarmTab:CreateSection(I.map .. " Area Farm")
-
-AreaFarmTab:CreateInput({
-    Name = I.map .. " Numero da Area",
-    PlaceholderText = "Ex: 1",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n then farmAreaIndex = n end
-    end,
-})
-
-AreaFarmTab:CreateInput({
-    Name = I.map .. " Raio",
-    PlaceholderText = "Padrao: 90",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 20 then farmAreaRadius = n end
-    end,
-})
-
-AreaFarmTab:CreateInput({
-    Name = I.map .. " Espacamento",
-    PlaceholderText = "Padrao: 28",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 8 then farmAreaStep = n end
-    end,
-})
-
-AreaFarmTab:CreateToggle({ Name = I.attack .. " Auto Farm Area + Attack", CurrentValue = false, Flag = "AutoFarmArea", Callback = function(v) autoFarmArea = v if v then startFarmAreaRoute() else stopFarmAreaRoute() end end })
-
-AreaFarmTab:CreateButton({
-    Name = I.map .. " Ir para Area",
-    Callback = function()
-        local center = getModelCenter(getAreaModel(farmAreaIndex))
-
-        if center then
-            local char = player.Character or player.CharacterAdded:Wait()
-            local root = char:WaitForChild("HumanoidRootPart")
-            root.CFrame = CFrame.new(center + Vector3.new(0, 4, 0))
-        else
-            notify(I.x .. " Area Farm", "Area nao encontrada.", 2)
-        end
-    end,
-})
-
-AreaFarmTab:CreateButton({
-    Name = I.eye .. " Debug Area Atual",
-    Callback = function()
-        local char = player.Character
-        local root = char and char:FindFirstChild("HumanoidRootPart")
-        if not root then return end
-
-        local closest
-        local closestDist = math.huge
-
-        for _, inst in ipairs(workspace:GetDescendants()) do
-            if inst:IsA("BasePart") then
-                local dist = (inst.Position - root.Position).Magnitude
-
-                if dist < closestDist then
-                    closestDist = dist
-                    closest = inst
-                end
-            end
-        end
-
-        if closest then
-            notify(I.eye .. " Area Debug", closest:GetFullName(), 8)
-        else
-            notify(I.eye .. " Area Debug", "Nada encontrado perto.", 4)
-        end
-    end,
-})
-
-WheelTab:CreateSection(I.wheel .. " Wheel")
-
-WheelTab:CreateDropdown({
-    Name = I.wheel .. " Wheel",
-    Options = { "Auto Detect", "Easter", "Default" },
-    CurrentOption = { "Auto Detect" },
-    MultipleOptions = false,
-    Flag = "SelectedWheel",
-    Callback = function(opt)
-        selectedWheelId = opt[1]
-    end,
-})
-
-WheelTab:CreateInput({ Name = I.wheel .. " WheelId Manual", PlaceholderText = "Opcional", RemoveTextAfterFocusLost = false, Callback = function(Text) if Text and Text ~= "" then selectedWheelId = Text end end })
-WheelTab:CreateInput({ Name = I.gear .. " Delay Wheel", PlaceholderText = "Padrao: 0.03", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 0.01 then wheelDelay = n end end })
-WheelTab:CreateInput({ Name = I.wheel .. " Burst", PlaceholderText = "Padrao: 1", RemoveTextAfterFocusLost = false, Callback = function(Text) local n = tonumber(Text) if n and n >= 1 then wheelBurst = math.floor(n) end end })
-WheelTab:CreateToggle({ Name = I.wheel .. " Auto Wheel", CurrentValue = false, Flag = "AutoWheel", Callback = function(v) State.autoWheel = v end })
-WheelTab:CreateButton({ Name = I.wheel .. " Girar Agora", Callback = spinSelectedWheel })
-
-WebhookTab:CreateSection(I.bell .. " Discord Webhook")
-
-WebhookTab:CreateInput({
-    Name = I.bell .. " Webhook URL",
-    PlaceholderText = "Cole o webhook aqui",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        webhookUrl = tostring(Text or "")
-    end,
-})
-
-WebhookTab:CreateInput({
-    Name = I.gear .. " Tempo em minutos",
-    PlaceholderText = "Padrao: 60",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        local n = tonumber(Text)
-        if n and n >= 1 then webhookDelayMinutes = n end
-    end,
-})
-
-WebhookTab:CreateToggle({ Name = I.bell .. " Ativar Webhook Automatico", CurrentValue = false, Flag = "WebhookEnabled", Callback = function(v) State.webhookEnabled = v lastWebhookAt = os.clock() end })
-WebhookTab:CreateButton({ Name = I.check .. " Test Webhook", Callback = function() sendWebhook("Teste do Unboxing Hub - Player: " .. tostring(player.Name)) notify(I.bell .. " Webhook", "Teste enviado.", 2) end })
-WebhookTab:CreateButton({ Name = I.stats .. " Enviar Relatorio Agora", Callback = function() sendWebhook(buildWebhookReport()) notify(I.bell .. " Webhook", "Relatorio enviado.", 2) end })
-
-StatsTab:CreateSection(I.stats .. " Stats")
-
-StatsTab:CreateButton({
-    Name = I.stats .. " Mostrar Stats",
-    Callback = function()
-        notify(
-            I.stats .. " Sessao",
-            "Tempo: " .. formatTime(os.clock() - Stats.startedAt)
-                .. " | Boxes: " .. tostring(Stats.boxesBroken)
-                .. " | Crates: " .. tostring(Stats.cratesOpened)
-                .. " | Merchant: " .. tostring(Stats.merchantBought)
-                .. " | Vendidos: " .. tostring(Stats.itemsSold),
-            7
-        )
-    end,
-})
-
-VisualTab:CreateSection(I.eye .. " Visual")
-
-VisualTab:CreateToggle({
-    Name = I.eye .. " Camera Lock",
-    CurrentValue = false,
-    Flag = "CameraLock",
-    Callback = function(v)
-        State.camLock = v
-        local camera = workspace.CurrentCamera
-
-        if v then
-            local char = player.Character or player.CharacterAdded:Wait()
-            local root = char:WaitForChild("HumanoidRootPart")
-            local center = root.Position
-
-            lockedCameraCenter = center
-            camera.CameraType = Enum.CameraType.Scriptable
-
-            if camConn then camConn:Disconnect() end
-
-            local angle = 0
-
-            camConn = RunService.RenderStepped:Connect(function(dt)
-                if not State.camLock then return end
-
-                angle = angle + dt * 1.5
-
-                local x = math.cos(angle) * 10
-                local z = math.sin(angle) * 10
-
-                camera.CFrame = CFrame.new(center + Vector3.new(x, 4, z), center)
-            end)
-        else
-            if camConn then camConn:Disconnect() camConn = nil end
-            camera.CameraType = Enum.CameraType.Custom
-        end
-    end,
-})
-
-VisualTab:CreateToggle({ Name = I.map .. " TPCamera Area Walk", CurrentValue = false, Flag = "TPCamera", Callback = function(v) State.tpCamera = v if v then startTPCameraRoute() else stopTPCameraRoute() end end })
-
-OtherTab:CreateSection(I.save .. " Save Config")
-
-OtherTab:CreateInput({
-    Name = I.save .. " Nome do Save",
-    PlaceholderText = "Ex: Save1",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(Text)
-        selectedSaveName = safeFileName(Text)
-    end,
-})
-
-OtherTab:CreateButton({ Name = I.save .. " Save", Callback = function() saveProfile(selectedSaveName) end })
-OtherTab:CreateButton({ Name = I.check .. " Carregar Save", Callback = function() loadProfile(selectedSaveName) end })
-
-OtherTab:CreateSection(I.gear .. " Other")
-
-OtherTab:CreateButton({
-    Name = I.eye .. " TurtleSpy",
-    Callback = function()
-        pcall(function()
-            loadstring(game:HttpGet("https://raw.githubusercontent.com/Turtle-Brand/Turtle-Spy/main/source.lua", true))()
-        end)
-    end,
-})
-
-OtherTab:CreateButton({
-    Name = I.shield .. " Anti Afk",
-    Callback = function()
-        pcall(function()
-            loadstring(game:HttpGet("https://raw.githubusercontent.com/hassanxzayn-lua/Anti-afk/main/antiafkbyhassanxzyn"))()
-        end)
-    end,
-})
-
-OtherTab:CreateButton({
-    Name = I.check .. " Copy Discord",
-    Callback = function()
-        setclipboard("https://discord.gg/myjsXgDEC3")
-        notify(I.check .. " Discord", "Copiado.", 2)
-    end,
-})
-
-task.spawn(function()
-    while task.wait(autoAttackDelay) do
-        if State.autoAttackBoxes then
-            pcall(function()
-                local box = getNearestBox()
-
-                if box and box.Field and box.Field.Id and box.Id then
-                    RE.AttackBox:FireServer(box.Field.Id, box.Id, Clock.now())
-                end
-            end)
-        end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(autoSellDelay) do
-        protectSpecialItems()
-
-        if State.autoSellHats then pcall(function() sellInventoryCategory("Hats") end) end
-        if State.autoSellPets then pcall(function() sellInventoryCategory("Pets") end) end
-        if State.autoSellPerks then pcall(function() sellInventoryCategory("Perks") end) end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(0.03) do
-        if State.autoWheel and os.clock() - lastWheelTick >= wheelDelay then
-            lastWheelTick = os.clock()
-
-            for _ = 1, wheelBurst do
-                task.spawn(spinSelectedWheel)
-            end
-        end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(0.5) do
-        if State.autoQuestClaim then
-            claimDamageQuest()
-        end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(1) do
-        if State.autoEasterCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "Easter2024Crate", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoBasicPerkCrate then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "BasicPerkCrate", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoHatDropBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "HatDropBoost", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoComumEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "ComumEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoRareEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "RareEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoEpicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EpicEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoLegendaryEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "LegendaryEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoGodlyEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "GodlyEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoMythicEventPotion then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MythicEventPotion", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoMoleBoost then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "MoleBoost", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-        if State.autoEventBooster then pcall(function() RF.PurchaseMerchantItem:InvokeServer({ ItemId = "EventBooster", MerchantId = "MoleMerchant" }) Stats.merchantBought = Stats.merchantBought + 1 end) end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(5) do
-        if State.webhookEnabled then
-            if os.clock() - lastWebhookAt >= webhookDelayMinutes * 60 then
-                lastWebhookAt = os.clock()
-                sendWebhook(buildWebhookReport())
-            end
-        end
-    end
-end)
-
-task.spawn(function()
-    while task.wait(3) do
-        if State.autoClose then
-            pcall(function()
-                StateUtil.ClosePage()
-            end)
-        end
-
-        if State.autoCloseRushResults then
-            pcall(function()
-                if RE:FindFirstChild("ClaimBoxRush") then
-                    RE.ClaimBoxRush:FireServer()
-                end
-
-                StateUtil.ClosePage("BoxRushResults")
-            end)
-        end
-
-        if State.autoEasterRush then
-            pcall(function()
-                local box = workspace:FindFirstChild("Easter")
-
-                if box and box:FindFirstChild("EasterBoxRush") then
-                    recordRush("Easter Rush")
-                    RE.StartBoxRush:FireServer(box.EasterBoxRush)
-                end
-            end)
-        end
-
-        if State.autoGoldRush then
-            pcall(function()
-                local areas = workspace:FindFirstChild("Areas")
-                local goldMine = areas and areas:FindFirstChild("23_GoldMine")
-
-                if goldMine and goldMine:FindFirstChild("GoldRush") then
-                    recordRush("Gold Rush")
-                    RE.StartBoxRush:FireServer(goldMine.GoldRush, autoRushWorld)
-                end
-            end)
-        end
-
-        if State.autoPerk then pcall(forceActivateEquippedPerks) end
-
-        if State.autoClaim then
-            for i = 1, 12 do
-                task.wait(0.1)
-                pcall(function() RE.ClaimPlaytimeReward:FireServer(i) end)
-            end
-        end
-
-        if State.autoBP then
-            for i = 1, 6 do
-                task.wait(0.2)
-                pcall(function() RE.ClaimBattlePassTask:FireServer(i) end)
-            end
-        end
-
-        if State.autoDaily then pcall(function() RE.ClaimLoginReward:FireServer() end) end
-        if State.autoAch then pcall(function() RE.ClaimAllAchievements:FireServer() end) end
-    end
-end)
-
-pcall(function()
-    GuiService.ErrorMessageChanged:Connect(function(message)
-        if message and tostring(message) ~= "" then
-            notifyKickWebhook(message)
-        end
-    end)
-end)
-
-pcall(function()
-    local promptGui = CoreGui:FindFirstChild("RobloxPromptGui")
-
-    if promptGui then
-        promptGui.DescendantAdded:Connect(function(inst)
-            if kickWebhookSent then return end
-
-            task.wait(0.2)
-
-            local text = ""
-
-            pcall(function()
-                if inst:IsA("TextLabel") or inst:IsA("TextButton") then
-                    text = inst.Text
-                end
-            end)
-
-            if text and text ~= "" then
-                local lower = string.lower(text)
-
-                if lower:find("kick")
-                    or lower:find("disconnect")
-                    or lower:find("error")
-                    or lower:find("lost connection")
-                    or lower:find("idle")
-                    or lower:find("inatividade")
-                    or lower:find("desconectado")
-                    or lower:find("erro") then
-                    notifyKickWebhook(text)
-                end
-            end
-        end)
-    end
-end)
-
-notify(I.gift .. " Unboxing Hub", "GUI carregado com ClaimDamegeQuest.", 4)
