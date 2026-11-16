@@ -2654,13 +2654,15 @@ function Dump.excluded(inst)
 	return false
 end
 
-function Dump._run()
+function Dump._run(rootsOverride, label)
 	local stamp = os.date("!%Y%m%d_%H%M%S")
-	local base = FSapi.ensureDir(CONFIG.EXPORT_DIR) .. "ubrc_fulltree_" .. stamp
-	local roots = Roots.list()
-	for _, name in ipairs({ "StarterGui", "StarterPlayer", "SoundService", "MaterialService" }) do
-		local s = svc(name)
-		if s then roots[#roots + 1] = { label = name, inst = s, tag = "other" } end
+	local base = FSapi.ensureDir(CONFIG.EXPORT_DIR) .. "ubrc_" .. (label and ("save_" .. label) or "fulltree") .. "_" .. stamp
+	local roots = rootsOverride or Roots.list()
+	if not rootsOverride then
+		for _, name in ipairs({ "StarterGui", "StarterPlayer", "SoundService", "MaterialService" }) do
+			local s = svc(name)
+			if s then roots[#roots + 1] = { label = name, inst = s, tag = "other" } end
+		end
 	end
 	local total = 0
 	for _, r in ipairs(roots) do
@@ -2767,23 +2769,73 @@ function Dump._run()
 	if truncated then Log.warn("Limite de " .. CONFIG.DUMP_MAX_NODES .. " nos atingido; o restante nao foi salvo.") end
 end
 
-function Dump.run()
+function Dump.run(rootsOverride, label)
 	if Dump.busy then
 		Log.warn("Salvar tudo j\u{E1} em andamento.")
 		return
 	end
 	if type(writefile) ~= "function" then
-		Log.err("SALVAR TUDO precisa de writefile, indispon\u{ED}vel neste executor.")
+		Log.err("SALVAR precisa de writefile, indispon\u{ED}vel neste executor.")
 		return
 	end
 	Dump.busy = true
-	local ok, err = pcall(Dump._run)
+	local ok, err = pcall(Dump._run, rootsOverride, label)
 	Dump.busy = false
-	if not ok then Log.err("Salvar tudo falhou: " .. tostring(err)) end
+	if not ok then Log.err("Salvar falhou: " .. tostring(err)) end
 end
 
 function Control.saveAll()
 	task.spawn(Dump.run)
+end
+
+-- Search by name (descendants of the readable roots) -> click a result -> its subtree is saved as JSON.
+local Search = { busy = false }
+function Search.run(query)
+	query = tostring(query or ""):lower()
+	if #query < 2 then
+		Log.warn("Digite ao menos 2 letras para buscar.")
+		return
+	end
+	if Search.busy then return end
+	Search.busy = true
+	task.spawn(function()
+		local res, t0 = {}, clock()
+		local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+		local rootsList = { Workspace, ReplicatedStorage, svc("ReplicatedFirst"), svc("StarterGui"), svc("StarterPack"), Lighting, PlayerGui, bp }
+		for _, root in ipairs(rootsList) do
+			if root and #res < 60 then
+				local ok, desc = pcall(root.GetDescendants, root)
+				if ok then
+					for _, d in ipairs(desc) do
+						if #res >= 60 then break end
+						if d.Name:lower():find(query, 1, true) then
+							local own = Session.ownGui
+							if not (own and (d == own or d:IsDescendantOf(own))) and not Dump.excluded(d) and not insideExcluded(d) then
+								res[#res + 1] = d
+							end
+						end
+						if clock() - t0 > CONFIG.FRAME_BUDGET then
+							task.wait()
+							t0 = clock()
+						end
+					end
+				end
+			end
+		end
+		Search.busy = false
+		Log.info(string.format("Busca '%s': %d resultado(s)%s.", query, #res, #res >= 60 and " (limite de 60)" or ""))
+		if GUI.showResults then GUI.showResults(res) end
+	end)
+end
+
+function Control.saveInstance(inst)
+	if not inst or not inst.Parent then
+		Log.warn("Objeto n\u{E3}o existe mais.")
+		return
+	end
+	local label = tostring(inst.Name):gsub("[^%w_%-]", "_"):sub(1, 30)
+	Log.info("Salvando: " .. path(inst))
+	task.spawn(Dump.run, { { label = inst.Name, inst = inst, tag = Roots.tagOf(inst) } }, label)
 end
 
 function Control.start()
@@ -2856,6 +2908,7 @@ local TABS = {
 	{ "Console", "console" }, { "Estrutura", "objects" }, { "Mundos", "worlds" }, { "Caixas", "boxes" }, { "Armas", "weapons" },
 	{ "Pets", "pets" }, { "Ovos", "eggs" }, { "Economia", "economy" }, { "Progress\u{E3}o", "progression" },
 	{ "Invent\u{E1}rio", "inventory" }, { "Interface", "ui" }, { "Eventos", "observed_events" },
+	{ "Buscar", "search" },
 }
 local SUMMARY_KEYS = {
 	boxes = { "health_current", "health_max", "world_kind" }, weapons = { "damage", "rarity", "attack_speed" }, pets = { "rarity", "category" },
@@ -2901,6 +2954,7 @@ function GUI.render()
 	end
 	g.stats.Text = string.format("Objetos registrados: %d | Categorias preenchidas: %d/%d | Eventos: %d | Watchers: %d", total, filled, #DATA_CATS,
 		#Store.lists.observed_events, Watch.count)
+	if GUI.tab == "search" then return end
 	local lines = {}
 	if GUI.tab == "console" then
 		local from = math.max(1, #Log.lines - 80)
@@ -2987,6 +3041,17 @@ function GUI.build()
 	local text = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
 		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, scroll)
 
+	-- search pane (tab "Buscar"): type a name, tap a result to save that object's subtree as JSON
+	local pane = mk("Frame", { Position = scroll.Position, Size = scroll.Size, BackgroundColor3 = PANEL, BorderSizePixel = 0, Visible = false }, body)
+	local qbox = mk("TextBox", { Position = UDim2.fromOffset(4, 4), Size = UDim2.new(1, -100, 0, 28), BackgroundColor3 = BG, BorderSizePixel = 0,
+		TextColor3 = Color3.new(1, 1, 1), PlaceholderText = "nome do objeto (ex: Weapons, World1, Egg)", PlaceholderColor3 = Color3.fromRGB(140, 145, 160),
+		Text = "", ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left }, pane)
+	local goBtn = mkBtn("BUSCAR", 0, 4, 90, pane, function() Search.run(qbox.Text) end)
+	goBtn.Position = UDim2.new(1, -94, 0, 4)
+	local resultList = mk("ScrollingFrame", { Position = UDim2.fromOffset(4, 38), Size = UDim2.new(1, -8, 1, -42), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, pane)
+	mk("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, resultList)
+
 	GUI.tab = "console"
 	local tabButtons = {}
 	for _, t in ipairs(TABS) do
@@ -2997,6 +3062,8 @@ function GUI.build()
 		Session.guiConns[#Session.guiConns + 1] = b.MouseButton1Click:Connect(function()
 			GUI.tab = t[2]
 			for k, btn in pairs(tabButtons) do btn.BackgroundColor3 = (k == GUI.tab) and ACC or PANEL end
+			scroll.Visible = GUI.tab ~= "search"
+			pane.Visible = GUI.tab == "search"
 			GUI.render()
 		end)
 	end
@@ -3019,7 +3086,30 @@ function GUI.build()
 		end
 	end)
 
-	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats }
+	GUI.refs = { gui = sg, main = main, body = text, fill = fill, progress = progress, stats = stats, list = resultList }
+end
+
+function GUI.showResults(res)
+	local g = GUI.refs
+	if not g or not g.list then return end
+	for _, c in ipairs(g.list:GetChildren()) do
+		if c:IsA("TextButton") then c:Destroy() end
+	end
+	for i, inst in ipairs(res) do
+		local row = Instance.new("TextButton")
+		row.Size = UDim2.new(1, -8, 0, 36)
+		row.LayoutOrder = i
+		row.BackgroundColor3 = Color3.fromRGB(46, 50, 64)
+		row.BorderSizePixel = 0
+		row.TextColor3 = Color3.new(1, 1, 1)
+		row.Font = Enum.Font.Code
+		row.TextSize = 10
+		row.TextWrapped = true
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.Text = "[" .. inst.ClassName .. "] " .. path(inst) .. "  (toque para salvar)"
+		row.Parent = g.list
+		row.MouseButton1Click:Connect(function() Control.saveInstance(inst) end)
+	end
 end
 
 function GUI.loop()
