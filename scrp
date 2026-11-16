@@ -60,15 +60,15 @@ local CONFIG = {
 	VERSION = "1.0",
 	FRAME_BUDGET = 0.006,          -- seconds of scan work per slice before yielding
 	MAX_RECORDS = {                -- hard memory caps per category (rejections are counted and exported)
-		objects = 12000, ui = 6000, worlds = 1500, boxes = 1500, weapons = 1500, pets = 2000,
+		objects = 12000, ui = 12000, worlds = 1500, boxes = 1500, weapons = 1500, pets = 2000,
 		eggs = 800, economy = 2500, progression = 1500, inventory = 3000, observed_events = 4000,
 	},
 	MAX_CHILDREN_PER_PARENT = 1500,
 	MAX_DEPTH = 60,
 	MAX_STRING = 240,
 	MAX_ATTRS = 60,
-	MAX_WATCHERS = 700,            -- cap on live event connections
-	MAX_QUEUE = 3000,              -- cap on pending DescendantAdded items
+	MAX_WATCHERS = 1200,            -- cap on live event connections
+	MAX_QUEUE = 8000,              -- cap on pending DescendantAdded items
 	QUEUE_PER_STEP = 150,
 	EVENT_MIN_INTERVAL = 1.0,      -- per (event kind, instance, property) seconds
 	EVENT_MAX_PER_KEY = 40,
@@ -77,6 +77,9 @@ local CONFIG = {
 	SINGLE_FILE_MAX_CHARS = 2400000,
 	PART_MAX_CHARS = 900000,
 	PRINT_CHUNK = 3000,
+	DUMP_MAX_NODES = 500000,       -- SALVAR TUDO: safety limit on nodes written
+	DUMP_MAX_CHILDREN = 20000,
+	DUMP_MAX_DEPTH = 120,
 	FETCH_PLACE_NAME = true,
 }
 
@@ -605,6 +608,7 @@ for _, group in ipairs({ KW.world, KW.portal, KW.npc, KW.shop }) do
 end
 local RARITY = set({ "common", "uncommon", "rare", "epic", "legendary", "mythic", "mythical", "secret", "exotic", "divine", "celestial",
 	"godly", "ultra", "supreme", "omega", "unique" })
+local GENERIC_CONTAINER = set({ "item", "list", "content", "all", "data", "config", "entry", "holder" })
 local GENERIC_UI = set({ "frame", "button", "label", "image", "icon", "scroll", "scrolling", "list", "grid", "layout", "header", "title",
 	"close", "bg", "background", "padding", "container", "holder", "main", "content", "top", "bottom", "left", "right", "text", "line",
 	"divider", "shadow", "stroke", "corner", "gradient" })
@@ -867,8 +871,14 @@ Events.lim = {}
 Events.limCount = 0
 Events.muted = 0
 Events.skipped = 0
+-- Lifecycle events are cheap to produce and flood the 4000-event cap (boxes spawn/despawn constantly);
+-- they get their own budgets so text/value/world changes keep room.
+local EVENT_BUDGET = { object_added = 1200, object_removed = 1200, world_changed = 300 }
+local DETAIL_KW = set({ "shop", "stat", "weapon", "pet", "egg", "index", "detail", "info", "upgrade", "rebirth", "inventory" })
+Events.kindCount, Events.budgetSkipped = {}, {}
 function Events.reset()
 	Events.lim, Events.limCount, Events.muted, Events.skipped = {}, 0, 0, 0
+	Events.kindCount, Events.budgetSkipped = {}, {}
 end
 
 function Events.push(kind, inst, rec, prop, old, new, extra)
@@ -877,17 +887,28 @@ function Events.push(kind, inst, rec, prop, old, new, extra)
 		return
 	end
 	local t = clock()
+	local budget = EVENT_BUDGET[kind]
+	if budget then
+		local n = Events.kindCount[kind] or 0
+		if n >= budget then
+			Events.budgetSkipped[kind] = (Events.budgetSkipped[kind] or 0) + 1
+			return
+		end
+		Events.kindCount[kind] = n + 1
+	end
 	if not (extra and extra.noLimit) then
 		local key = kind .. ":" .. (inst and Util.uid(inst) or 0) .. ":" .. tostring(prop)
 		local lim = Events.lim[key]
+		local minInt = extra and extra.minInterval or CONFIG.EVENT_MIN_INTERVAL
+		local maxPer = extra and extra.maxPerKey or CONFIG.EVENT_MAX_PER_KEY
 		if lim then
 			if lim.muted then return end
-			if t - lim.t < CONFIG.EVENT_MIN_INTERVAL then
+			if t - lim.t < minInt then
 				Events.skipped = Events.skipped + 1
 				return
 			end
 			lim.n = lim.n + 1
-			if lim.n > CONFIG.EVENT_MAX_PER_KEY then
+			if lim.n > maxPer then
 				lim.muted = true
 				Events.muted = Events.muted + 1
 				return
@@ -923,7 +944,7 @@ function Events.push(kind, inst, rec, prop, old, new, extra)
 	}
 	if extra then
 		for k, v in pairs(extra) do
-			if k ~= "noLimit" then P[k] = plain(v) end
+			if k ~= "noLimit" and k ~= "maxPerKey" and k ~= "minInterval" then P[k] = plain(v) end
 		end
 	end
 	Store.add("observed_events", {
@@ -1121,7 +1142,17 @@ function Watch.onText(inst, rec)
 	end
 	rec.properties.text = tt
 	rec.properties.last_changed_unix = os.time()
-	Events.push("text_changed", inst, rec, "Text", old, tt)
+	-- detail panels (shop stats, pet/egg info...) show ONE selected item at a time: store the neighbouring
+	-- texts (item name, price, stats) with the change so each stats text can be paired with its item.
+	local extra
+	if tt:find("%d") and hit(ancestorTokens(inst, 5), DETAIL_KW) then
+		local panel = inst
+		for _ = 1, 3 do
+			if panel.Parent and panel.Parent ~= PlayerGui then panel = panel.Parent end
+		end
+		extra = { panel_texts = L(collectTexts(panel, 14)), maxPerKey = 400, minInterval = 0.3 }
+	end
+	Events.push("text_changed", inst, rec, "Text", old, tt, extra)
 	-- propagate to modules that derive facts from texts
 	Economy.onText(inst, t)
 	Progression.onText(inst, t)
@@ -1163,6 +1194,16 @@ function Queue.reset()
 end
 function Queue.push(inst)
 	if Queue.set[inst] or Store.seen[inst] then return end
+	local cls = inst.ClassName
+	if NOISE[cls] then
+		Store.noiseCounts[cls] = (Store.noiseCounts[cls] or 0) + 1
+		return
+	end
+	if inst.Parent and inst.Parent.ClassName == "Model" and inst:IsA("BasePart") then
+		local key = "BasePart in Model (" .. cls .. ")"
+		Store.noiseCounts[key] = (Store.noiseCounts[key] or 0) + 1
+		return
+	end
 	if Queue.tail - Queue.head + 1 >= CONFIG.MAX_QUEUE then
 		Queue.dropped = Queue.dropped + 1
 		return
@@ -1228,6 +1269,12 @@ addModule("structure", function(inst, ctx)
 			return
 		end
 	end
+	if inst:IsA("BasePart") and ctx.parentCls == "Model" and next(ctx:attrs()) == nil then
+		-- plain sub-part of a Model: the Model record already carries position/size; only counted
+		local key = "BasePart in Model (" .. cls .. ")"
+		Store.noiseCounts[key] = (Store.noiseCounts[key] or 0) + 1
+		return
+	end
 	local P = { class = cls, path = ctx:path(), root = ctx.rootTag, parent = ctx.parent and path(ctx.parent) or NO }
 	for k, v in pairs(geometry(inst, false)) do P[k] = v end
 	local a = ctx:attrs()
@@ -1289,17 +1336,44 @@ function Items.match(inst, ctx, spec)
 		return nil
 	end
 	if spec.tool and cls == "Tool" then return "tool_class", "tool" end
-	if not isEntity3D(inst) then return nil end
-	local own = hit(ctx.nameTok, spec.kw)
+	local entity = isEntity3D(inst)
+	if not entity and cls ~= "Folder" then return nil end
+	local reason, kwHit
+	local own = entity and hit(ctx.nameTok, spec.kw)
 	if own and not (spec.ex and hit(ctx.nameTok, spec.ex)) then
-		if ctx.parent and (ctx.parentCls == "Model" or ctx.parent:IsA("BasePart")) and hit(ctx.parentTok, spec.kw) then return nil end
-		return "self_name", own
-	end
-	if ctx.parent and (ctx.parentCls == "Folder" or ctx.parentCls == "Configuration") then
+		-- a BasePart inside a Model is a sub-part of that model, never an item of its own
+		if inst:IsA("BasePart") and ctx.parentCls == "Model" then return nil end
+		if Items.ancestorMatches(inst, spec, own) then return nil end
+		reason, kwHit = "self_name", own
+	elseif ctx.parent and (ctx.parentCls == "Folder" or ctx.parentCls == "Configuration") then
 		local par = hit(ctx.parentTok, spec.kw)
-		if par then return "container_child", par end
+		if par then
+			reason, kwHit = "container_child", par
+		elseif hit(ctx.parentTok, GENERIC_CONTAINER) and ctx.parent.Parent then
+			local gp = ctx.parent.Parent
+			if gp:IsA("Folder") or gp:IsA("Configuration") then
+				local gpar = hit(Tok.of(gp.Name), spec.kw)
+				if gpar then reason, kwHit = "container_grandchild", gpar end
+			end
+		end
 	end
-	return nil
+	if not reason then return nil end
+	if spec.accept and not spec.accept(inst, ctx, reason, kwHit) then return nil end
+	return reason, kwHit
+end
+
+-- true when an ancestor Model/BasePart/Tool already matched the same keyword (the instance is just a piece of it)
+function Items.ancestorMatches(inst, spec, own)
+	local cur = inst.Parent
+	for _ = 1, 6 do
+		if not cur or cur == game then return false end
+		if cur:IsA("Model") or cur:IsA("BasePart") or cur:IsA("Tool") then
+			local h = hit(Tok.of(cur.Name), spec.kw)
+			if h and h == own and not (spec.ex and hit(Tok.of(cur.Name), spec.ex)) then return true end
+		end
+		cur = cur.Parent
+	end
+	return false
 end
 
 function Items.record(inst, ctx, spec, reason, kwHit)
@@ -1574,6 +1648,11 @@ Items.makeModule({
 ---- B. WORLDS (worlds, portals, npcs, shops) ----------------------------------------------------
 Items.makeModule({
 	cat = "worlds", kw = KW.worldAll, ui = true,
+	accept = function(inst, ctx, reason, kw)
+		-- loose parts named "area/zone" are decoration; only portals/npcs/shops may be single parts
+		if inst:IsA("BasePart") and not (kw and (KW.portal[kw] or KW.npc[kw] or KW.shop[kw])) then return false end
+		return true
+	end,
 	fields = function(P, FS, m, facts, inst, ctx, kwHit)
 		local tok = ctx.nameTok
 		local kind = "world"
@@ -1627,11 +1706,32 @@ function Economy.onText(inst, text)
 	if P then Store.upsert("economy", inst, inst.Name, P, "gui_text:" .. P.path, "medium") end
 end
 
+-- Attribute records are capped per attribute NAME (60 instances) so one attribute repeated on thousands of
+-- copies (e.g. "Currency" on every box mesh) cannot flood the category. Skipped copies are still summarized
+-- (distinct values + counts) and exported inside `limitations`.
+local ATTR_QUOTA = 60
+local function newAttrTracker() return { keyCount = {}, keySkipped = {}, values = {}, seenKey = {} } end
+Economy.tr, Progression.tr = newAttrTracker(), newAttrTracker()
+local function attrAllowed(tr, key, k, v)
+	local prev = tr.seenKey[key]
+	if prev ~= nil then return prev end
+	local vs = tr.values[k]
+	if not vs then vs = { n = 0, d = {} }; tr.values[k] = vs end
+	local sv = tostring(v)
+	if vs.d[sv] ~= nil then vs.d[sv] = vs.d[sv] + 1 elseif vs.n < 40 then vs.n = vs.n + 1; vs.d[sv] = 1 end
+	local c = (tr.keyCount[k] or 0) + 1
+	tr.keyCount[k] = c
+	local ok = c <= ATTR_QUOTA
+	if not ok then tr.keySkipped[k] = (tr.keySkipped[k] or 0) + 1 end
+	tr.seenKey[key] = ok
+	return ok
+end
+
 function Economy.scanAttrs(inst, ctx, only)
 	local a = ctx and ctx:attrs() or Util.attrs(inst)
 	if next(a) == nil then return end
 	for k, v in pairs(a) do
-		if (only == nil or only == k) and hit(Tok.of(k), KW.econ) then
+		if (only == nil or only == k) and hit(Tok.of(k), KW.econ) and attrAllowed(Economy.tr, "a:" .. Util.uid(inst) .. ":" .. k, k, v) then
 			local r = Store.upsert("economy", "a:" .. Util.uid(inst) .. ":" .. k, k,
 				{ kind = "attribute", value = v, owner_path = path(inst), owner_class = inst.ClassName, attribute = k },
 				"attribute:" .. path(inst) .. "#" .. k, "high")
@@ -1685,7 +1785,7 @@ function Progression.scanAttrs(inst, ctx, only)
 	for k, v in pairs(a) do
 		if only == nil or only == k then
 			local tok = Tok.of(k)
-			if hit(tok, KW.prog) or hit(tok, KW.world) then
+			if (hit(tok, KW.prog) or hit(tok, KW.world)) and attrAllowed(Progression.tr, "a:" .. Util.uid(inst) .. ":" .. k, k, v) then
 				local r = Store.upsert("progression", "a:" .. Util.uid(inst) .. ":" .. k, k,
 					{ kind = "attribute", value = v, owner_path = path(inst), owner_class = inst.ClassName, attribute = k },
 					"attribute:" .. path(inst) .. "#" .. k, "high")
@@ -1947,7 +2047,9 @@ function World.track()
 	local checked = 0
 	for _, rec in ipairs(Store.lists.worlds) do
 		local P = rec.properties
-		if P.world_kind == "world" and P.root ~= "playergui" and not P.removed_observed and type(P.position) == "table" and type(P.position.x) == "number" then
+		local big = type(P.size) ~= "table" or (type(P.size.x) == "number" and type(P.size.z) == "number" and P.size.x >= 40 and P.size.z >= 40)
+		if P.world_kind == "world" and P.root ~= "playergui" and P.class == "Model" and big and not P.removed_observed
+			and type(P.position) == "table" and type(P.position.x) == "number" then
 			checked = checked + 1
 			if checked > 400 then break end
 			local dx, dy, dz = pos.X - P.position.x, pos.Y - P.position.y, pos.Z - P.position.z
@@ -2227,7 +2329,8 @@ local STATIC_LIMITS = {
 	{ "timing_accuracy", "Times (lifetime, time-to-destroy) are measured by this client from the events it observes; replication latency and the first-observed moment limit their accuracy." },
 	{ "world_detection", "Current-world detection is a distance heuristic against world records (low confidence) plus player attribute/leaderstat changes when present." },
 	{ "event_rate_limit", "Observed events are rate limited per target/property and capped; record values still update, but not every intermediate change is stored." },
-	{ "noise_classes", "Decorative classes without attributes (Attachment, Weld, Decal, particle/light classes, UI layout helpers) are only counted, not listed." },
+	{ "noise_classes", "Decorative classes without attributes (Attachment, Weld, Decal, SurfaceAppearance, particle/light classes, UI layout helpers) and plain parts that sit inside a Model are only counted, not listed; the Model record carries their position/size." },
+	{ "attribute_quota", "Economy/progression attribute records are limited to 60 instances per attribute name; further copies are summarized (distinct values + counts) in the attribute_summary_* limitation entries." },
 	{ "delta_api", "File export depends on the executor's writefile/readfile/makefolder. Export capabilities detected at runtime are listed in metadata.export_capabilities." },
 }
 
@@ -2244,8 +2347,21 @@ function Exporter.limitations()
 		end
 	end
 	for _, k in ipairs(Store.noteOrder) do add("note", Store.notes[k]) end
+	for _, pair in ipairs({ { "economy", Economy.tr }, { "progression", Progression.tr } }) do
+		local tr = pair[2]
+		for k, vs in pairs(tr.values) do
+			if (tr.keySkipped[k] or 0) > 0 then
+				add("attribute_summary_" .. pair[1] .. "_" .. k, Json.encode({
+					attribute = k, records_kept = ATTR_QUOTA, further_instances_only_counted = tr.keySkipped[k],
+					distinct_values_and_counts = vs.d, note = "counts are approximate; at most 40 distinct values tracked" }))
+			end
+		end
+	end
 	if Queue.dropped > 0 then add("queue_overflow", Queue.dropped .. " DescendantAdded items were dropped because the queue was full.") end
 	if Watch.capHit then add("watcher_cap", "The cap of " .. CONFIG.MAX_WATCHERS .. " live watchers was reached; some objects are not monitored for changes.") end
+	for kind, n in pairs(Events.budgetSkipped) do
+		add("event_budget_" .. kind, n .. " '" .. kind .. "' events were not stored (budget " .. EVENT_BUDGET[kind] .. " per kind, so they cannot fill the whole event list).")
+	end
 	if Events.muted > 0 or Events.skipped > 0 then add("events_rate_limited", Events.skipped .. " events skipped by rate limit, " .. Events.muted .. " keys muted after " .. CONFIG.EVENT_MAX_PER_KEY .. " events.") end
 	if Session.missed > 0 then add("missed_while_paused", Session.missed .. " change notifications arrived while paused/idle and were not recorded.") end
 	for _, m in ipairs(Modules) do
@@ -2301,17 +2417,24 @@ function Exporter._run()
 	local stamp = os.date("!%Y%m%d_%H%M%S")
 	local fsCaps = FSapi.detect()
 	local encoded, counts, failures = {}, {}, 0
+	-- Snapshot EVERYTHING synchronously first: the encode loop below yields, and the user may press
+	-- LIMPAR DADOS or the game may keep adding records while it runs.
+	local snaps = {}
+	for _, cat in ipairs(DATA_CATS) do
+		local s = {}
+		for i, r in ipairs(Store.lists[cat]) do s[i] = r end
+		snaps[cat] = s
+	end
+	local noiseSnap = {}
+	for k, v in pairs(Store.noiseCounts) do noiseSnap[k] = v end
+	local lims = Exporter.limitations()
+	local snapState, snapScan, snapScanEnd = Session.state, Session.scanState, Session.tScanEnd
 	local ly = clock()
 	for _, cat in ipairs(DATA_CATS) do
-		local snap = {}
-		for i, r in ipairs(Store.lists[cat]) do snap[i] = r end
-		if cat == "objects" then
-			local nz = 0
-			for _ in pairs(Store.noiseCounts) do nz = nz + 1 end
-			if nz > 0 then
-				snap[#snap + 1] = { id = "obj_noise_summary", name = "skipped_noise_class_counts", category = "objects", source = "collector", confidence = "high",
-					collected_at = Util.iso(), properties = { kind = "class_summary", counts = Store.noiseCounts, note = "counted, not listed" } }
-			end
+		local snap = snaps[cat]
+		if cat == "objects" and next(noiseSnap) ~= nil then
+			snap[#snap + 1] = { id = "obj_noise_summary", name = "skipped_noise_class_counts", category = "objects", source = "collector", confidence = "high",
+				collected_at = Util.iso(), properties = { kind = "class_summary", counts = noiseSnap, note = "counted, not listed" } }
 		end
 		local out = {}
 		for _, rec in ipairs(snap) do
@@ -2327,7 +2450,6 @@ function Exporter._run()
 		encoded[cat] = out
 		counts[cat] = #out
 	end
-	local lims = Exporter.limitations()
 	if failures > 0 then
 		lims[#lims + 1] = { id = string.format("lim_%03d", #lims + 1), name = "serialization_failures", category = "limitations",
 			properties = { description = failures .. " records could not be serialized and were replaced by error stubs." }, source = "collector",
@@ -2348,8 +2470,8 @@ function Exporter._run()
 			game_name = "Unboxing Simulator", collector = "Unboxing Reference Collector", version = CONFIG.VERSION, timestamp = Util.iso(),
 			place_id = tostring(game.PlaceId), collection_scope = "client_observable",
 			game_id = tostring(game.GameId), place_name_observed = Session.placeName or NO, executor = executor,
-			session_state = Session.state, scan_state = Session.scanState,
-			scan_duration_seconds = Session.tScanEnd and r2(Session.tScanEnd - Session.t0) or NO,
+			session_state = snapState, scan_state = snapScan,
+			scan_duration_seconds = snapScanEnd and r2(snapScanEnd - Session.t0) or NO,
 			streaming_enabled = get(Workspace, "StreamingEnabled") == true,
 			record_counts = counts, export_capabilities = fsCaps,
 		}
@@ -2454,6 +2576,216 @@ end
 ------------------------------------------------------------------------------------------------------
 -- 12. CONTROL + GUI
 ------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+-- SAVE ALL: whole client-visible tree -> JSON parts (names, classes, attributes, tags, plain properties).
+-- This is a JSON tree for reference, NOT a .rbxl/.rbxm: it cannot be opened in Studio.
+-- Script sources are never read (scripts are listed by name/class only). Other players' characters/folders
+-- and the collector's own GUI are skipped. Streams to disk part by part (low memory), writes everything in one run.
+------------------------------------------------------------------------------------------------------
+local Dump = { busy = false, nodes = 0, total = 1, files = 0 }
+
+function FSapi.ensureDir(dir)
+	local caps = FSapi.detect()
+	if not (caps.writefile and caps.makefolder and caps.isfolder) then return "" end
+	local ok, exists = pcall(isfolder, dir)
+	if ok and not exists then pcall(makefolder, dir) end
+	local ok2, ex2 = pcall(isfolder, dir)
+	if ok2 and ex2 == true then return dir .. "/" end
+	return ""
+end
+
+local function dumpProps(inst, cls)
+	local P = {}
+	local function putP(k, raw) if raw ~= nil then P[k] = plain(raw) end end
+	if inst:IsA("BasePart") then
+		putP("pos", get(inst, "Position")); putP("size", get(inst, "Size")); putP("ori", get(inst, "Orientation"))
+		local tr = get(inst, "Transparency")
+		if tr and tr ~= 0 then putP("transparency", tr) end
+		putP("anchored", get(inst, "Anchored")); putP("collide", get(inst, "CanCollide")); putP("material", get(inst, "Material"))
+		local col = get(inst, "Color")
+		if col then P.color = plain(col).hex end
+		if cls == "MeshPart" then putP("mesh", get(inst, "MeshId")); putP("tex", get(inst, "TextureID")) end
+		if cls == "Part" then putP("shape", get(inst, "Shape")) end
+	elseif inst:IsA("Model") then
+		local ok, cf = pcall(inst.GetPivot, inst)
+		if ok and cf then
+			local pc = plain(cf)
+			P.pos, P.ori = pc.position, pc.orientation_degrees
+		end
+		local pp = get(inst, "PrimaryPart")
+		if pp then P.primary = pp.Name end
+	elseif inst:IsA("ValueBase") then
+		putP("value", get(inst, "Value"))
+	elseif inst:IsA("GuiObject") then
+		putP("visible", get(inst, "Visible")); putP("pos", get(inst, "Position")); putP("size", get(inst, "Size"))
+		putP("layout_order", get(inst, "LayoutOrder")); putP("z", get(inst, "ZIndex"))
+		local bg = get(inst, "BackgroundColor3")
+		if bg then P.bg = plain(bg).hex end
+		if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then putP("text", get(inst, "Text")) end
+		if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then putP("image", get(inst, "Image")) end
+	elseif inst:IsA("LayerCollector") then
+		putP("enabled", get(inst, "Enabled"))
+	elseif inst:IsA("ProximityPrompt") then
+		putP("action", get(inst, "ActionText")); putP("object", get(inst, "ObjectText")); putP("hold", get(inst, "HoldDuration"))
+		putP("distance", get(inst, "MaxActivationDistance"))
+	elseif inst:IsA("Tool") then
+		putP("tooltip", get(inst, "ToolTip"))
+	elseif inst:IsA("Humanoid") then
+		putP("max_health", get(inst, "MaxHealth")); putP("display_name", get(inst, "DisplayName"))
+	elseif inst:IsA("Decal") or inst:IsA("Texture") then
+		putP("texture", get(inst, "Texture"))
+	elseif inst:IsA("SpecialMesh") then
+		putP("mesh", get(inst, "MeshId")); putP("scale", get(inst, "Scale"))
+	elseif inst:IsA("Sound") then
+		putP("sound", get(inst, "SoundId"))
+	elseif inst:IsA("Animation") then
+		putP("animation", get(inst, "AnimationId"))
+	elseif inst:IsA("LuaSourceContainer") then
+		P.script_source = "never_read"
+	end
+	return P
+end
+
+function Dump.excluded(inst)
+	if inst == Session.ownGui then return true end
+	local cls = inst.ClassName
+	if cls == "Model" and Players:GetPlayerFromCharacter(inst) then return true end
+	if (cls == "Folder" or cls == "Model") and OtherPlayers[inst.Name] then return true end
+	return false
+end
+
+function Dump._run()
+	local stamp = os.date("!%Y%m%d_%H%M%S")
+	local base = FSapi.ensureDir(CONFIG.EXPORT_DIR) .. "ubrc_fulltree_" .. stamp
+	local roots = Roots.list()
+	for _, name in ipairs({ "StarterGui", "StarterPlayer", "SoundService", "MaterialService" }) do
+		local s = svc(name)
+		if s then roots[#roots + 1] = { label = name, inst = s, tag = "other" } end
+	end
+	local total = 0
+	for _, r in ipairs(roots) do
+		local ok, c = pcall(function() return #r.inst:GetDescendants() end)
+		total = total + (ok and c or 0) + 1
+	end
+	Dump.nodes, Dump.total, Dump.files = 0, math.max(total, 1), 0
+
+	local ids = setmetatable({}, { __mode = "k" })
+	local n, buf, size, parts, failed, truncated = 0, {}, 0, 0, nil, false
+	local written, rootIds = {}, {}
+
+	local function flush()
+		if #buf == 0 then return end
+		parts = parts + 1
+		local fname = string.format("%s_p%03d.json", base, parts)
+		local meta = Json.encode({ kind = "full_tree_dump", part = parts, place_id = tostring(game.PlaceId), created = Util.iso(),
+			note = "keys: i=id p=parent id n=name c=class a=attributes t=tags v=plain properties; script source never read" }, { "kind" })
+		local data = '{"metadata":' .. meta .. ',"nodes":[\n' .. table.concat(buf, ",\n") .. "\n]}"
+		local count = #buf
+		local ok, status = FSapi.write(fname, data)
+		if ok then
+			written[#written + 1] = { file = fname, nodes = count, chars = #data, status = status }
+			Dump.files = #written
+		else
+			failed = tostring(status)
+		end
+		buf, size = {}, 0
+		task.wait()
+	end
+
+	local function emit(inst, pid)
+		n = n + 1
+		ids[inst] = n
+		local cls = inst.ClassName
+		local node = { i = n, p = pid, n = trunc(inst.Name), c = cls }
+		local a = Util.attrs(inst)
+		if next(a) ~= nil then node.a = a end
+		local tg = Util.tags(inst)
+		if #tg > 0 then node.t = tg end
+		local v = dumpProps(inst, cls)
+		if next(v) ~= nil then node.v = v end
+		local s = Json.encode(node)
+		buf[#buf + 1] = s
+		size = size + #s + 2
+		Dump.nodes = n
+		if size >= CONFIG.PART_MAX_CHARS then flush() end
+	end
+
+	local t0 = clock()
+	for _, r in ipairs(roots) do
+		if failed or truncated then break end
+		Log.info("Salvar tudo: " .. r.label)
+		emit(r.inst, 0)
+		rootIds[r.label] = n
+		local stack, sp = {}, 0
+		local function push(inst, depth)
+			local ok, ch = pcall(inst.GetChildren, inst)
+			if ok and #ch > 0 then
+				if #ch > CONFIG.DUMP_MAX_CHILDREN then
+					Store.note("dump_children:" .. path(inst), "SALVAR TUDO: only the first " .. CONFIG.DUMP_MAX_CHILDREN .. " of " .. #ch .. " children of " .. path(inst) .. " were written.")
+				end
+				sp = sp + 1
+				stack[sp] = { ch, 1, depth, ids[inst] }
+			end
+		end
+		push(r.inst, 1)
+		while sp > 0 and not failed do
+			local f = stack[sp]
+			local ch, i = f[1], f[2]
+			if i > math.min(#ch, CONFIG.DUMP_MAX_CHILDREN) then
+				stack[sp] = nil
+				sp = sp - 1
+			else
+				f[2] = i + 1
+				local inst = ch[i]
+				local skip = Dump.excluded(inst) or (r.tag == "player" and inst == PlayerGui)
+				if not skip then
+					if n >= CONFIG.DUMP_MAX_NODES then
+						truncated = true
+						break
+					end
+					local okE, errE = pcall(emit, inst, f[4])
+					if not okE then Log.errOnce("dump", "save all node: " .. tostring(errE)) end
+					if f[3] < CONFIG.DUMP_MAX_DEPTH and ids[inst] then push(inst, f[3] + 1) end
+				end
+				if clock() - t0 > CONFIG.FRAME_BUDGET * 1.5 then
+					task.wait()
+					t0 = clock()
+				end
+			end
+		end
+	end
+	flush()
+	local idx = { kind = "full_tree_index", place_id = tostring(game.PlaceId), created = Util.iso(), nodes = n, parts = written, roots = rootIds,
+		truncated_at_node_limit = truncated, write_error = failed or NULL,
+		excluded = "other players' characters/folders, the collector's own GUI, script sources (never read)", format = "JSON tree for reference; not loadable in Studio" }
+	FSapi.write(base .. "_index.json", Json.encode(idx))
+	if failed then
+		Log.err("Salvar tudo: falha ao gravar (" .. failed .. "). Gravados " .. #written .. " arquivo(s).")
+	else
+		Log.info(string.format("Salvar tudo concluido: %d nos em %d arquivo(s) (%s_*.json).", n, #written, base))
+	end
+	if truncated then Log.warn("Limite de " .. CONFIG.DUMP_MAX_NODES .. " nos atingido; o restante nao foi salvo.") end
+end
+
+function Dump.run()
+	if Dump.busy then
+		Log.warn("Salvar tudo j\u{E1} em andamento.")
+		return
+	end
+	if type(writefile) ~= "function" then
+		Log.err("SALVAR TUDO precisa de writefile, indispon\u{ED}vel neste executor.")
+		return
+	end
+	Dump.busy = true
+	local ok, err = pcall(Dump._run)
+	Dump.busy = false
+	if not ok then Log.err("Salvar tudo falhou: " .. tostring(err)) end
+end
+
+function Control.saveAll()
+	task.spawn(Dump.run)
+end
+
 function Control.start()
 	if Session.state ~= "idle" then
 		Log.warn("Coleta j\u{E1} iniciada (estado: " .. Session.state .. ").")
@@ -2515,6 +2847,7 @@ function Control.clear()
 	Session.missed = 0
 	Session.stats = { visited = 0, total = 1 }
 	for _, m in ipairs(Modules) do m.errors = 0; m.disabled = false end
+	Economy.tr, Progression.tr = newAttrTracker(), newAttrTracker()
 	Log.once, Log.suppressed = {}, 0
 	Log.info("Dados limpos. Pressione INICIAR COLETA para recome\u{E7}ar.")
 end
@@ -2562,6 +2895,10 @@ function GUI.render()
 	g.fill.Size = UDim2.new(pct, 0, 1, 0)
 	local phase = S.scanState == "complete" and "monitorando" or (S.scanState == "scanning" and "escaneando" or S.scanState)
 	g.progress.Text = string.format("%s %d%%  (estado: %s)", phase, floor(pct * 100), S.state)
+	if Dump.busy then
+		g.fill.Size = UDim2.new(math.min(Dump.nodes / math.max(Dump.total, 1), 0.99), 0, 1, 0)
+		g.progress.Text = string.format("salvando \u{E1}rvore: %d/~%d n\u{F3}s, %d arquivo(s)", Dump.nodes, Dump.total, Dump.files)
+	end
 	g.stats.Text = string.format("Objetos registrados: %d | Categorias preenchidas: %d/%d | Eventos: %d | Watchers: %d", total, filled, #DATA_CATS,
 		#Store.lists.observed_events, Watch.count)
 	local lines = {}
@@ -2605,7 +2942,7 @@ function GUI.build()
 	end
 	local BG, PANEL, ACC = Color3.fromRGB(24, 26, 33), Color3.fromRGB(36, 39, 50), Color3.fromRGB(70, 110, 200)
 
-	local main = mk("Frame", { Size = UDim2.fromOffset(430, 400), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = BG, BorderSizePixel = 0 }, sg)
+	local main = mk("Frame", { Size = UDim2.fromOffset(430, 430), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = BG, BorderSizePixel = 0 }, sg)
 	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
 	local title = mk("TextLabel", { Size = UDim2.new(1, -60, 0, 28), BackgroundColor3 = PANEL, BorderSizePixel = 0, Text = "  Unboxing Reference Collector v" .. CONFIG.VERSION,
 		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, main)
@@ -2620,7 +2957,7 @@ function GUI.build()
 		end)
 		return b
 	end
-	local min = mkBtn("-", 370, 1, 28, main, function() body.Visible = not body.Visible; main.Size = body.Visible and UDim2.fromOffset(430, 400) or UDim2.fromOffset(430, 28) end)
+	local min = mkBtn("-", 370, 1, 28, main, function() body.Visible = not body.Visible; main.Size = body.Visible and UDim2.fromOffset(430, 430) or UDim2.fromOffset(430, 28) end)
 	local close = mkBtn("X", 400, 1, 28, main, function() ENV.UBRC_INSTANCE.Destroy() end)
 	min.Position = UDim2.new(1, -60, 0, 1); close.Position = UDim2.new(1, -30, 0, 1)
 	min.Size = UDim2.fromOffset(28, 26); close.Size = UDim2.fromOffset(28, 26)
@@ -2632,19 +2969,20 @@ function GUI.build()
 	mkBtn("EXPORTAR JSON", 8, 36, 132, body, Control.export)
 	mkBtn("ATUALIZAR INVENT\u{C1}RIO", 149, 36, 132, body, Control.refreshInventory)
 	mkBtn("LIMPAR DADOS", 290, 36, 132, body, Control.clear)
+	mkBtn("SALVAR TUDO (\u{C1}RVORE COMPLETA EM JSON)", 8, 66, 414, body, Control.saveAll)
 
-	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 68), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
+	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 98), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
 	local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(80, 180, 120), BorderSizePixel = 0 }, barBg)
 	local progress = mk("TextLabel", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "ocioso", TextColor3 = Color3.new(1, 1, 1),
 		Font = Enum.Font.Gotham, TextSize = 11, ZIndex = 2 }, barBg)
-	local stats = mk("TextLabel", { Position = UDim2.fromOffset(8, 88), Size = UDim2.new(1, -16, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(200, 205, 220),
+	local stats = mk("TextLabel", { Position = UDim2.fromOffset(8, 118), Size = UDim2.new(1, -16, 0, 28), BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(200, 205, 220),
 		Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, body)
 
-	local tabBar = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 118), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1, BorderSizePixel = 0,
+	local tabBar = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 148), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1, BorderSizePixel = 0,
 		ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.X, ScrollingDirection = Enum.ScrollingDirection.X }, body)
 	mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabBar)
 
-	local scroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 152), Size = UDim2.new(1, -16, 1, -160), BackgroundColor3 = PANEL, BorderSizePixel = 0,
+	local scroll = mk("ScrollingFrame", { Position = UDim2.fromOffset(8, 182), Size = UDim2.new(1, -16, 1, -190), BackgroundColor3 = PANEL, BorderSizePixel = 0,
 		ScrollBarThickness = 5, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y }, body)
 	local text = mk("TextLabel", { Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 220, 235),
 		Font = Enum.Font.Code, TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, RichText = false }, scroll)
