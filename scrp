@@ -2970,7 +2970,11 @@ local ModuleReader = { busy = false }
 local MODULE_NAMES = { "ItemData", "EggData", "CrateData", "DropRateModule", "AreaData", "FieldData", "BoostData", "PerkData", "WorldData",
 	"UpgradeData", "VariantData", "VariantRates", "LoginRewardData", "QuestlineData", "AbilityData", "GlobalBossData", "UniverseData",
 	"LockedAreaData", "StarterPerkPathData", "HoldUpRewardData", "EventData", "InfoData", "UpdateData", "BoxTrialsTuning", "HauntTrialsTuning",
-	"GameConfig", "FeatureConfig", "HighscoreData" }
+	"GameConfig", "FeatureConfig", "HighscoreData",
+	-- where weapon damage / power / speed may live (found by name in the UNIVERSAL SEARCH save)
+	"WeaponList", "StatsModule", "PinnedStats", "PetAttack", "Progression", "RelicLevels", "ItemBoostStack", "BoostCap", "Config", "GameData",
+	"NewPlayerPace", "ItemList", "RecipesList", "StarterHats", "Numbers" }
+local MODULES_FOLDER_NAMES = { "Pet", "ContentData" }
 local MODULE_MAX_ENTRIES = 400000
 
 local function moduleTargets()
@@ -2983,6 +2987,12 @@ local function moduleTargets()
 		end
 	end
 	local mods = ReplicatedStorage:FindFirstChild("Modules")
+	if mods then
+		for _, name in ipairs(MODULES_FOLDER_NAMES) do
+			local m = mods:FindFirstChild(name)
+			if m and m:IsA("ModuleScript") then list[#list + 1] = { name = "Modules_" .. name, inst = m, kind = "data" } end
+		end
+	end
 	local pd = mods and mods:FindFirstChild("PlayerData")
 	if pd and pd:IsA("ModuleScript") then list[#list + 1] = { name = "PlayerData", inst = pd, kind = "own_player_data", field = "data" } end
 	local ctrl = ReplicatedStorage:FindFirstChild("Controllers")
