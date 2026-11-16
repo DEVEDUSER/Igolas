@@ -3041,7 +3041,14 @@ local function snapshot(v, st, depth)
 				else key = "<" .. typeof(ek) .. ">" .. i end
 				st.n = st.n + 1
 				local lk = key:lower()
-				if lk:find("userid", 1, true) or lk:find("username", 1, true) then
+				local sensitive = lk:find("userid", 1, true) or lk:find("username", 1, true)
+				if st.redact and not sensitive then
+					-- your own PlayerData also holds session/account bookkeeping: never written to disk
+					for _, bad in ipairs({ "session", "clientuid", "mail", "codes", "feedback", "admin", "receipt", "purchase", "jobid", "serverid" }) do
+						if lk:find(bad, 1, true) then sensitive = true break end
+					end
+				end
+				if sensitive then
 					out[key] = "<removed>"
 				else
 					out[key] = snapshot(entries[i][2], st, depth + 1)
@@ -3087,7 +3094,7 @@ function ModuleReader._run()
 				row.note = "module did not return a readable table (type " .. typeof(root) .. ")"
 				Log.warn(t.name .. ": " .. row.note)
 			else
-				local st = { n = 0, functions = 0, over = false, stack = {} }
+				local st = { n = 0, functions = 0, over = false, stack = {}, redact = (t.kind == "own_player_data") }
 				local okS, snap = pcall(snapshot, root, st, 0)
 				if not okS then
 					row.error = tostring(snap)
@@ -3125,6 +3132,101 @@ end
 
 function Control.readModules()
 	task.spawn(ModuleReader.run)
+end
+
+-- LER ITENS: every ModuleScript under ReplicatedStorage.Items (Weapon/Pet/Hat/Misc/Perk...) read as a TABLE,
+-- exactly like the data modules above: no game function is called. One file per category (split every ~3 MB).
+function ModuleReader._runItems()
+	local root = ReplicatedStorage:FindFirstChild("Items")
+	if not root then
+		Log.warn("ReplicatedStorage.Items n\u{E3}o encontrado.")
+		return
+	end
+	local stamp = os.date("!%Y%m%d_%H%M%S")
+	local dir = FSapi.ensureDir(CONFIG.EXPORT_DIR)
+	local sub = FSapi.ensureDir(CONFIG.EXPORT_DIR .. "/items_" .. stamp)
+	if sub ~= "" then dir = sub end
+	local index = { kind = "items_modules_dump", created = Util.iso(), place_id = tostring(game.PlaceId), categories = {},
+		rules = "read-only: module tables only, no game function called, no remote touched" }
+	local totalEntries, GLOBAL_MAX = 0, 3000000
+	local t0 = clock()
+	for _, cat in ipairs(root:GetChildren()) do
+		local mods = {}
+		if cat:IsA("ModuleScript") then mods[1] = cat end
+		for _, d in ipairs(cat:GetDescendants()) do
+			if d:IsA("ModuleScript") then mods[#mods + 1] = d end
+		end
+		table.sort(mods, function(a, b) return path(a) < path(b) end)
+		local row = { category = cat.Name, modules = #mods, read_ok = 0, failed = {}, functions_only = {}, files = {} }
+		local parts, size, partN = {}, 0, 0
+		local safeName = tostring(cat.Name):gsub("[^%w_%-]", "_")
+		local function flush()
+			if #parts == 0 then return end
+			partN = partN + 1
+			local fname = string.format("%sItems_%s_p%02d.json", dir, safeName, partN)
+			local data = '{"category":' .. Json.encode(cat.Name) .. ',"part":' .. partN .. ',"modules":{' .. table.concat(parts, ",") .. "}}"
+			local okW, status = FSapi.write(fname, data)
+			row.files[#row.files + 1] = { file = fname, chars = #data, write = okW and status or ("FAILED: " .. tostring(status)) }
+			parts, size = {}, 0
+			task.wait()
+		end
+		for _, m in ipairs(mods) do
+			if totalEntries >= GLOBAL_MAX then
+				row.stopped = "global entry budget reached"
+				break
+			end
+			local rel = path(m)
+			rel = rel:gsub("^ReplicatedStorage%.Items%.", "")
+			local ok, res = safeRequire(m)
+			if not ok then
+				row.failed[#row.failed + 1] = { module = rel, error = tostring(res) }
+			elseif type(res) ~= "table" then
+				row.failed[#row.failed + 1] = { module = rel, error = "returned " .. typeof(res) }
+			else
+				local st = { n = 0, functions = 0, over = false, stack = {} }
+				local okS, snap = pcall(snapshot, res, st, 0)
+				if okS then
+					row.read_ok = row.read_ok + 1
+					totalEntries = totalEntries + st.n
+					if st.n - st.functions <= 0 then row.functions_only[#row.functions_only + 1] = rel end
+					local enc = Json.encode({ entries = st.n, functions_not_called = st.functions, truncated = st.over, data = snap })
+					parts[#parts + 1] = Json.encode(rel) .. ":" .. enc
+					size = size + #enc + #rel + 4
+					if size >= 3000000 then flush() end
+				else
+					row.failed[#row.failed + 1] = { module = rel, error = tostring(snap) }
+				end
+			end
+			if clock() - t0 > CONFIG.FRAME_BUDGET then
+				task.wait()
+				t0 = clock()
+			end
+		end
+		flush()
+		index.categories[#index.categories + 1] = row
+		Log.info(string.format("Itens/%s: %d/%d m\u{F3}dulos lidos, %d falha(s), %d s\u{F3} com fun\u{E7}\u{F5}es.", cat.Name, row.read_ok, row.modules, #row.failed, #row.functions_only))
+	end
+	FSapi.write(dir .. "_index.json", Json.encode(index))
+	Log.info("Itens: conclu\u{ED}do. Pasta: " .. dir)
+end
+
+function ModuleReader.runItems()
+	if ModuleReader.busy then
+		Log.warn("Leitura de m\u{F3}dulos j\u{E1} em andamento.")
+		return
+	end
+	if type(writefile) ~= "function" then
+		Log.err("LER ITENS precisa de writefile, indispon\u{ED}vel neste executor.")
+		return
+	end
+	ModuleReader.busy = true
+	local ok, err = pcall(ModuleReader._runItems)
+	ModuleReader.busy = false
+	if not ok then Log.err("Leitura de itens falhou: " .. tostring(err)) end
+end
+
+function Control.readItems()
+	task.spawn(ModuleReader.runItems)
 end
 
 function Control.start()
@@ -3311,8 +3413,9 @@ function GUI.build()
 	mkBtn("EXPORTAR JSON", 8, 36, 132, body, Control.export)
 	mkBtn("ATUALIZAR INVENT\u{C1}RIO", 149, 36, 132, body, Control.refreshInventory)
 	mkBtn("LIMPAR DADOS", 290, 36, 132, body, Control.clear)
-	mkBtn("SALVAR TUDO (\u{C1}RVORE)", 8, 66, 204, body, Control.saveAll)
-	mkBtn("LER M\u{D3}DULOS DE DADOS", 218, 66, 204, body, Control.readModules)
+	mkBtn("SALVAR TUDO (\u{C1}RVORE)", 8, 66, 132, body, Control.saveAll)
+	mkBtn("LER M\u{D3}DULOS", 149, 66, 132, body, Control.readModules)
+	mkBtn("LER ITENS (Items/*)", 290, 66, 132, body, Control.readItems)
 
 	local barBg = mk("Frame", { Position = UDim2.fromOffset(8, 98), Size = UDim2.new(1, -16, 0, 16), BackgroundColor3 = PANEL, BorderSizePixel = 0 }, body)
 	local fill = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(80, 180, 120), BorderSizePixel = 0 }, barBg)
