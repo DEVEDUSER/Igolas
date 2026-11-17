@@ -1,8 +1,8 @@
 --[[
-  ReferenceMeasurer.lua  -  MEASURES (does not copy) the interface and the models you can see in a Roblox place.
-  Writes JSON files to the workspace folder "UnboxingMeasure/".
-  Saves numbers only: UI position/size/colours/corner/stroke/gradient/layout/text/font, and for models the bounding box and
-  per part position/rotation/size/colour/material/shape. NEVER saves scripts, asset ids (images, meshes, textures, sounds) or animations.
+  ReferenceMeasurer v2 - MEASURES (does not copy) the interface and models of the game you are in.
+  Saves numbers only (positions, sizes, colours, text, fonts, part sizes...). Never scripts, asset ids, meshes, textures, sounds.
+  v2: shows a status box on screen (you see what happens), catches every error, works without freezing, and has a clipboard fallback.
+  Files go to the executor's workspace folder "UnboxingMeasure".
 ]]
 
 local HttpService = game:GetService("HttpService")
@@ -13,11 +13,41 @@ local Workspace = game:GetService("Workspace")
 local OUT = "UnboxingMeasure"
 local MAX_UI_NODES = 12000
 local MAX_PARTS_PER_MODEL = 120
-local MAX_MODELS = 400
+local MAX_MODELS = 300
 
-local MODEL_NAME_PATTERNS = { "^Box%d+$", "^Gift%d+$", "^HalloweenBox$", "^HalloweenGift$", "^Static", "^Ghost", "^Egg", "^Stand$", "^Tree$", "^Fence$",
+local MODEL_NAME_PATTERNS = { "^Box%d+$", "^Gift%d+$", "^HalloweenBox$", "^HalloweenGift$", "^Egg", "^Stand$", "^Tree$", "^Fence$",
     "^Wall$", "^Barrel$", "^Banner$", "^Pumpkin$", "^DeadTree$", "^Building$", "^UFO$", "^Kelp$", "^Portal", "^Chest", "^TicketWheel$", "^Crab$" }
 local MODEL_FOLDERS = { "Workspace.Worlds.World1.Lobby", "Workspace.Worlds.World1.Areas" }
+
+-- ---------------------------------------------------------------- status box (so you can see it working)
+local function findParent()
+    local ok, g = pcall(function() return gethui and gethui() end)
+    if ok and g then return g end
+    local ok2 = pcall(function() return game:GetService("CoreGui").Name end)
+    if ok2 then return game:GetService("CoreGui") end
+    return Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+local statusGui = Instance.new("ScreenGui")
+statusGui.Name = "MeasurerStatus"
+statusGui.ResetOnSpawn = false
+statusGui.DisplayOrder = 999999
+pcall(function() statusGui.Parent = findParent() end)
+local box = Instance.new("TextLabel")
+box.Size = UDim2.new(0.9, 0, 0, 120)
+box.Position = UDim2.new(0.05, 0, 0.04, 0)
+box.BackgroundColor3 = Color3.fromRGB(20, 24, 40)
+box.BackgroundTransparency = 0.1
+box.TextColor3 = Color3.fromRGB(255, 255, 255)
+box.TextWrapped = true
+box.TextScaled = true
+box.Font = Enum.Font.GothamBold
+box.Text = "Measurer v2 starting..."
+box.Parent = statusGui
+local function status(text)
+    box.Text = "Measurer: " .. text
+    print("[Measurer] " .. text)
+    task.wait()
+end
 
 local function r(n) return math.floor(n * 100 + 0.5) / 100 end
 local function c3(c) if typeof(c) ~= "Color3" then return nil end return { math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5) } end
@@ -26,154 +56,185 @@ local function ud2(v) return { ud(v.X), ud(v.Y) } end
 local function v3(v) return { r(v.X), r(v.Y), r(v.Z) } end
 local function enumName(e) return e and tostring(e):match("%.([^%.]+)$") or nil end
 
-if not (writefile and makefolder) then
-    warn("This executor has no writefile/makefolder: cannot save.")
-    return
+local canWrite = (typeof(writefile) == "function") and (typeof(makefolder) == "function")
+local saved, clipboardParts = {}, {}
+if canWrite then
+    pcall(function() if isfolder and not isfolder(OUT) then makefolder(OUT) end end)
 end
-if isfolder and not isfolder(OUT) then makefolder(OUT) end
 local function save(name, data)
-    writefile(OUT .. "/" .. name .. ".json", HttpService:JSONEncode(data))
+    local json = HttpService:JSONEncode(data)
+    if canWrite then
+        local ok, err = pcall(writefile, OUT .. "/" .. name .. ".json", json)
+        if ok then table.insert(saved, name) else status("could not write " .. name .. ": " .. tostring(err)) end
+    else
+        table.insert(clipboardParts, '"' .. name .. '":' .. json)
+    end
 end
 
--- ---------------------------------------------------------------- UI
-local nodes = 0
-local function dumpGui(inst, depth)
-    nodes += 1
-    if nodes > MAX_UI_NODES or depth > 14 then return nil end
-    local n = { n = inst.Name, c = inst.ClassName }
-    if inst:IsA("GuiObject") then
-        n.vis = inst.Visible
-        n.pos = ud2(inst.Position)
-        n.size = ud2(inst.Size)
-        n.anchor = { r(inst.AnchorPoint.X), r(inst.AnchorPoint.Y) }
-        n.absPos = { r(inst.AbsolutePosition.X), r(inst.AbsolutePosition.Y) }
-        n.absSize = { r(inst.AbsoluteSize.X), r(inst.AbsoluteSize.Y) }
-        n.bg = c3(inst.BackgroundColor3)
-        n.bgT = r(inst.BackgroundTransparency)
-        n.z = inst.ZIndex
-        n.order = inst.LayoutOrder
-        if inst.ClipsDescendants then n.clip = true end
-        if inst.Rotation ~= 0 then n.rot = r(inst.Rotation) end
-    end
-    if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
-        n.text = inst.Text
-        n.font = enumName(inst.Font)
-        n.textSize = inst.TextSize
-        n.textColor = c3(inst.TextColor3)
-        n.textStrokeT = r(inst.TextStrokeTransparency)
-        n.textStroke = c3(inst.TextStrokeColor3)
-        n.scaled = inst.TextScaled or nil
-        n.xAlign = enumName(inst.TextXAlignment)
-        n.yAlign = enumName(inst.TextYAlignment)
-        n.rich = inst.RichText or nil
-    end
-    if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
-        n.hasImage = inst.Image ~= ""      -- the asset id itself is NOT saved
-        n.imageColor = c3(inst.ImageColor3)
-        n.imageT = r(inst.ImageTransparency)
-        n.scaleType = enumName(inst.ScaleType)
-        n.sliceCenter = (inst.ScaleType == Enum.ScaleType.Slice) and { inst.SliceCenter.Min.X, inst.SliceCenter.Min.Y, inst.SliceCenter.Max.X, inst.SliceCenter.Max.Y } or nil
-    end
-    if inst:IsA("ScrollingFrame") then
-        n.canvas = ud2(inst.CanvasSize)
-        n.scrollBar = inst.ScrollBarThickness
-    end
-    if inst:IsA("UICorner") then n.radius = ud(inst.CornerRadius) end
-    if inst:IsA("UIStroke") then n.stroke = { c3(inst.Color), inst.Thickness, r(inst.Transparency), enumName(inst.ApplyStrokeMode) } end
-    if inst:IsA("UIGradient") then
-        local ks = {}
-        for _, k in ipairs(inst.Color.Keypoints) do table.insert(ks, { r(k.Time), c3(k.Value) }) end
-        n.gradient = { ks, r(inst.Rotation) }
-    end
-    if inst:IsA("UIListLayout") then n.list = { enumName(inst.FillDirection), ud(inst.Padding), enumName(inst.HorizontalAlignment), enumName(inst.VerticalAlignment), enumName(inst.SortOrder) } end
-    if inst:IsA("UIGridLayout") then n.grid = { ud2(inst.CellSize), ud2(inst.CellPadding), enumName(inst.FillDirection) } end
-    if inst:IsA("UIPadding") then n.padding = { ud(inst.PaddingTop), ud(inst.PaddingBottom), ud(inst.PaddingLeft), ud(inst.PaddingRight) } end
-    if inst:IsA("UIAspectRatioConstraint") then n.aspect = r(inst.AspectRatio) end
-    if inst:IsA("UISizeConstraint") then n.sizeLimit = { v3(Vector3.new(inst.MinSize.X, inst.MinSize.Y, 0)), v3(Vector3.new(inst.MaxSize.X, inst.MaxSize.Y, 0)) } end
-    if inst:IsA("UIScale") then n.scale = r(inst.Scale) end
-    local kids = {}
-    for _, child in ipairs(inst:GetChildren()) do
-        if child:IsA("GuiBase2d") or child:IsA("UIBase") or child:IsA("LayerCollector") then
+local function main()
+    status("reading the interface...")
+    local nodes = 0
+    local function dumpGui(inst, depth)
+        nodes += 1
+        if nodes % 400 == 0 then task.wait() end
+        if nodes > MAX_UI_NODES or depth > 14 then return nil end
+        local n = { n = inst.Name, c = inst.ClassName }
+        if inst:IsA("GuiObject") then
+            n.vis = inst.Visible
+            n.pos = ud2(inst.Position)
+            n.size = ud2(inst.Size)
+            n.anchor = { r(inst.AnchorPoint.X), r(inst.AnchorPoint.Y) }
+            n.absPos = { r(inst.AbsolutePosition.X), r(inst.AbsolutePosition.Y) }
+            n.absSize = { r(inst.AbsoluteSize.X), r(inst.AbsoluteSize.Y) }
+            n.bg = c3(inst.BackgroundColor3)
+            n.bgT = r(inst.BackgroundTransparency)
+            n.z = inst.ZIndex
+            n.order = inst.LayoutOrder
+            if inst.ClipsDescendants then n.clip = true end
+            if inst.Rotation ~= 0 then n.rot = r(inst.Rotation) end
+        end
+        if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+            n.text = inst.Text
+            n.font = enumName(inst.Font)
+            n.textSize = inst.TextSize
+            n.textColor = c3(inst.TextColor3)
+            n.textStrokeT = r(inst.TextStrokeTransparency)
+            n.textStroke = c3(inst.TextStrokeColor3)
+            n.scaled = inst.TextScaled or nil
+            n.xAlign = enumName(inst.TextXAlignment)
+            n.yAlign = enumName(inst.TextYAlignment)
+        end
+        if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+            n.hasImage = inst.Image ~= ""      -- the asset id itself is NOT saved
+            n.imageColor = c3(inst.ImageColor3)
+            n.imageT = r(inst.ImageTransparency)
+            n.scaleType = enumName(inst.ScaleType)
+        end
+        if inst:IsA("ScrollingFrame") then n.scrollBar = inst.ScrollBarThickness end
+        if inst:IsA("UICorner") then n.radius = ud(inst.CornerRadius) end
+        if inst:IsA("UIStroke") then n.stroke = { c3(inst.Color), inst.Thickness, r(inst.Transparency) } end
+        if inst:IsA("UIGradient") then
+            local ks = {}
+            for _, k in ipairs(inst.Color.Keypoints) do table.insert(ks, { r(k.Time), c3(k.Value) }) end
+            n.gradient = { ks, r(inst.Rotation) }
+        end
+        if inst:IsA("UIListLayout") then n.list = { enumName(inst.FillDirection), ud(inst.Padding), enumName(inst.HorizontalAlignment), enumName(inst.VerticalAlignment) } end
+        if inst:IsA("UIGridLayout") then n.grid = { ud2(inst.CellSize), ud2(inst.CellPadding) } end
+        if inst:IsA("UIPadding") then n.padding = { ud(inst.PaddingTop), ud(inst.PaddingBottom), ud(inst.PaddingLeft), ud(inst.PaddingRight) } end
+        if inst:IsA("UIAspectRatioConstraint") then n.aspect = r(inst.AspectRatio) end
+        if inst:IsA("UIScale") then n.scale = r(inst.Scale) end
+        local kids = {}
+        for _, child in ipairs(inst:GetChildren()) do
             local k = dumpGui(child, depth + 1)
             if k then table.insert(kids, k) end
         end
+        if #kids > 0 then n.k = kids end
+        return n
     end
-    if #kids > 0 then n.k = kids end
-    return n
-end
 
-local camera = Workspace.CurrentCamera
-local meta = { viewport = camera and { camera.ViewportSize.X, camera.ViewportSize.Y } or nil, touch = game:GetService("UserInputService").TouchEnabled }
-save("meta", meta)
+    local camera = Workspace.CurrentCamera
+    save("meta", { viewport = camera and { camera.ViewportSize.X, camera.ViewportSize.Y } or nil, touch = game:GetService("UserInputService").TouchEnabled })
 
-local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-for _, gui in ipairs(playerGui:GetChildren()) do
-    if gui:IsA("ScreenGui") then
-        nodes = 0
-        local ok, tree = pcall(dumpGui, gui, 0)
-        if ok and tree then save("ui_" .. gui.Name:gsub("[^%w]", "_"), tree) end
-    end
-end
-local uiTemplates = ReplicatedStorage:FindFirstChild("UI")
-if uiTemplates then
-    for _, child in ipairs(uiTemplates:GetChildren()) do
-        nodes = 0
-        local ok, tree = pcall(dumpGui, child, 0)
-        if ok and tree then save("uitemplate_" .. child.Name:gsub("[^%w]", "_"), tree) end
-    end
-end
-
--- ---------------------------------------------------------------- models
-local function dumpModel(m)
-    local parts = {}
-    for _, d in ipairs(m:GetDescendants()) do
-        if d:IsA("BasePart") then table.insert(parts, d) end
-    end
-    if #parts == 0 then return nil end
-    local pivot = m:IsA("BasePart") and m.CFrame or m:GetPivot()
-    local box, size = m:GetBoundingBox()
-    local out = { n = m.Name, c = m.ClassName, path = m:GetFullName(), box = { v3(pivot:PointToObjectSpace(box.Position)), v3(size) }, count = #parts, parts = {} }
-    table.sort(parts, function(a, b) return a.Size.X * a.Size.Y * a.Size.Z > b.Size.X * b.Size.Y * b.Size.Z end)
-    for i = 1, math.min(#parts, MAX_PARTS_PER_MODEL) do
-        local p = parts[i]
-        local rel = pivot:ToObjectSpace(p.CFrame)
-        local rx, ry, rz = rel:ToOrientation()
-        table.insert(out.parts, {
-            n = p.Name, c = p.ClassName, pos = v3(rel.Position), rot = { r(math.deg(rx)), r(math.deg(ry)), r(math.deg(rz)) }, size = v3(p.Size),
-            color = c3(p.Color), mat = enumName(p.Material), t = r(p.Transparency), shape = p:IsA("Part") and enumName(p.Shape) or nil,
-            mesh = p:IsA("MeshPart") or nil, -- only "this is a mesh part"; the mesh id is NOT saved
-        })
-    end
-    return out
-end
-
-local found, seenModels = {}, {}
-local function consider(inst)
-    if #found >= MAX_MODELS or seenModels[inst] then return end
-    if inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Folder") then
-        seenModels[inst] = true
-        local ok, data = pcall(dumpModel, inst)
-        if ok and data then table.insert(found, data) end
-    end
-end
-for _, root in ipairs({ ReplicatedStorage, Workspace }) do
-    for _, d in ipairs(root:GetDescendants()) do
-        for _, pat in ipairs(MODEL_NAME_PATTERNS) do
-            if string.match(d.Name, pat) and (d:IsA("Model") or d:IsA("BasePart")) then consider(d) break end
+    local guiCount = 0
+    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Name ~= "MeasurerStatus" then
+            nodes = 0
+            local ok, tree = pcall(dumpGui, gui, 0)
+            if ok and tree then
+                save("ui_" .. (gui.Name:gsub("[^%w]", "_")), tree)
+                guiCount += 1
+                status("UI saved: " .. gui.Name)
+            else
+                status("UI skipped (" .. gui.Name .. "): " .. tostring(tree))
+            end
         end
-        if #found >= MAX_MODELS then break end
+    end
+    local uiTemplates = ReplicatedStorage:FindFirstChild("UI")
+    if uiTemplates then
+        for _, child in ipairs(uiTemplates:GetChildren()) do
+            nodes = 0
+            local ok, tree = pcall(dumpGui, child, 0)
+            if ok and tree then save("uitemplate_" .. (child.Name:gsub("[^%w]", "_")), tree) guiCount += 1 end
+        end
+    end
+
+    status("measuring models (can take a minute)...")
+    local function dumpModel(m)
+        local parts = {}
+        for _, d in ipairs(m:GetDescendants()) do
+            if d:IsA("BasePart") then table.insert(parts, d) end
+        end
+        if m:IsA("BasePart") then table.insert(parts, m) end
+        if #parts == 0 then return nil end
+        local out = { n = m.Name, c = m.ClassName, path = m:GetFullName(), count = #parts, parts = {} }
+        local pivot
+        if m:IsA("Model") then pivot = m:GetPivot() elseif m:IsA("BasePart") then pivot = m.CFrame else pivot = parts[1].CFrame end
+        if m:IsA("Model") then
+            local bbCf, bbSize = m:GetBoundingBox()
+            out.box = { v3(pivot:PointToObjectSpace(bbCf.Position)), v3(bbSize) }
+        end
+        table.sort(parts, function(a, b) return a.Size.X * a.Size.Y * a.Size.Z > b.Size.X * b.Size.Y * b.Size.Z end)
+        for i = 1, math.min(#parts, MAX_PARTS_PER_MODEL) do
+            local p = parts[i]
+            local rel = pivot:ToObjectSpace(p.CFrame)
+            local rx, ry, rz = rel:ToOrientation()
+            table.insert(out.parts, {
+                n = p.Name, c = p.ClassName, pos = v3(rel.Position), rot = { r(math.deg(rx)), r(math.deg(ry)), r(math.deg(rz)) }, size = v3(p.Size),
+                color = c3(p.Color), mat = enumName(p.Material), t = r(p.Transparency), shape = p:IsA("Part") and enumName(p.Shape) or nil,
+                mesh = p:IsA("MeshPart") or nil, -- only "this is a mesh part"; the mesh id is NOT saved
+            })
+        end
+        return out
+    end
+
+    local found, seen, scanned = {}, {}, 0
+    local function consider(inst)
+        if #found >= MAX_MODELS or seen[inst] then return end
+        if inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Folder") then
+            seen[inst] = true
+            local ok, data = pcall(dumpModel, inst)
+            if ok and data then table.insert(found, data) end
+        end
+    end
+    for _, path in ipairs(MODEL_FOLDERS) do
+        local node = game
+        for part in string.gmatch(path, "[^%.]+") do node = node and node:FindFirstChild(part) end
+        if node then
+            for _, child in ipairs(node:GetChildren()) do consider(child) end
+        end
+    end
+    for _, root in ipairs({ ReplicatedStorage, Workspace }) do
+        for _, d in ipairs(root:GetDescendants()) do
+            scanned += 1
+            if scanned % 1500 == 0 then task.wait() end
+            if (d:IsA("Model") or d:IsA("BasePart")) then
+                for _, pat in ipairs(MODEL_NAME_PATTERNS) do
+                    if string.match(d.Name, pat) then consider(d) break end
+                end
+            end
+            if #found >= MAX_MODELS then break end
+        end
+    end
+    for i = 1, #found, 30 do
+        local chunk = {}
+        for j = i, math.min(i + 29, #found) do table.insert(chunk, found[j]) end
+        save(string.format("models_%02d", math.floor((i - 1) / 30) + 1), chunk)
+    end
+
+    if canWrite then
+        status(string.format("DONE! %d UI trees + %d models saved in the executor's workspace folder '%s' (%d files). Zip that folder and send it.", guiCount, #found, OUT, #saved))
+    else
+        local blob = "{" .. table.concat(clipboardParts, ",") .. "}"
+        if typeof(setclipboard) == "function" then
+            setclipboard(blob)
+            status("Your executor cannot write files, so the data was COPIED TO THE CLIPBOARD. Paste it into a text file and send it.")
+        else
+            status("Your executor can neither write files nor use the clipboard. Tell me which executor you use.")
+        end
     end
 end
-for _, path in ipairs(MODEL_FOLDERS) do
-    local node = game
-    for part in string.gmatch(path, "[^%.]+") do node = node and node:FindFirstChild(part) end
-    if node then
-        for _, child in ipairs(node:GetChildren()) do consider(child) end
-    end
-end
-for i = 1, #found, 40 do
-    local chunk = {}
-    for j = i, math.min(i + 39, #found) do table.insert(chunk, found[j]) end
-    save(string.format("models_%02d", (i - 1) // 40 + 1), chunk)
-end
-print(string.format("DONE: UI trees saved, %d models measured. Zip the folder workspace/%s and send it.", #found, OUT))
+
+local ok, err = pcall(main)
+if not ok then status("ERROR: " .. tostring(err)) end
+task.delay(600, function() statusGui:Destroy() end)
