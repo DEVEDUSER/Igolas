@@ -1,9 +1,11 @@
 --[[
-  ReferenceMeasurer v2 - MEASURES (does not copy) the interface and models of the game you are in.
-  Saves numbers only (positions, sizes, colours, text, fonts, part sizes...). Never scripts, asset ids, meshes, textures, sounds.
-  v2: shows a status box on screen (you see what happens), catches every error, works without freezing, and has a clipboard fallback.
-  Files go to the executor's workspace folder "UnboxingMeasure".
+  ReferenceMeasurer v3 - MEASURES (does not copy) the interface and models of the game you are in.
+  Saves numbers only. Never scripts, asset ids, meshes, textures, sounds.
+  Shows a status box on screen, catches every error, has a clipboard fallback. Files: workspace folder "UnboxingMeasure".
 ]]
+
+print("[Measurer] script started")
+pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Measurer", Text = "script started", Duration = 6 }) end)
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
@@ -19,7 +21,6 @@ local MODEL_NAME_PATTERNS = { "^Box%d+$", "^Gift%d+$", "^HalloweenBox$", "^Hallo
     "^Wall$", "^Barrel$", "^Banner$", "^Pumpkin$", "^DeadTree$", "^Building$", "^UFO$", "^Kelp$", "^Portal", "^Chest", "^TicketWheel$", "^Crab$" }
 local MODEL_FOLDERS = { "Workspace.Worlds.World1.Lobby", "Workspace.Worlds.World1.Areas" }
 
--- ---------------------------------------------------------------- status box (so you can see it working)
 local function findParent()
     local ok, g = pcall(function() return gethui and gethui() end)
     if ok and g then return g end
@@ -41,7 +42,7 @@ box.TextColor3 = Color3.fromRGB(255, 255, 255)
 box.TextWrapped = true
 box.TextScaled = true
 box.Font = Enum.Font.GothamBold
-box.Text = "Measurer v2 starting..."
+box.Text = "Measurer starting..."
 box.Parent = statusGui
 local function status(text)
     box.Text = "Measurer: " .. text
@@ -75,7 +76,7 @@ local function main()
     status("reading the interface...")
     local nodes = 0
     local function dumpGui(inst, depth)
-        nodes += 1
+        nodes = nodes + 1
         if nodes % 400 == 0 then task.wait() end
         if nodes > MAX_UI_NODES or depth > 14 then return nil end
         local n = { n = inst.Name, c = inst.ClassName }
@@ -105,7 +106,7 @@ local function main()
             n.yAlign = enumName(inst.TextYAlignment)
         end
         if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
-            n.hasImage = inst.Image ~= ""      -- the asset id itself is NOT saved
+            n.hasImage = inst.Image ~= ""
             n.imageColor = c3(inst.ImageColor3)
             n.imageT = r(inst.ImageTransparency)
             n.scaleType = enumName(inst.ScaleType)
@@ -143,7 +144,7 @@ local function main()
             local ok, tree = pcall(dumpGui, gui, 0)
             if ok and tree then
                 save("ui_" .. (gui.Name:gsub("[^%w]", "_")), tree)
-                guiCount += 1
+                guiCount = guiCount + 1
                 status("UI saved: " .. gui.Name)
             else
                 status("UI skipped (" .. gui.Name .. "): " .. tostring(tree))
@@ -155,7 +156,7 @@ local function main()
         for _, child in ipairs(uiTemplates:GetChildren()) do
             nodes = 0
             local ok, tree = pcall(dumpGui, child, 0)
-            if ok and tree then save("uitemplate_" .. (child.Name:gsub("[^%w]", "_")), tree) guiCount += 1 end
+            if ok and tree then save("uitemplate_" .. (child.Name:gsub("[^%w]", "_")), tree) guiCount = guiCount + 1 end
         end
     end
 
@@ -182,7 +183,7 @@ local function main()
             table.insert(out.parts, {
                 n = p.Name, c = p.ClassName, pos = v3(rel.Position), rot = { r(math.deg(rx)), r(math.deg(ry)), r(math.deg(rz)) }, size = v3(p.Size),
                 color = c3(p.Color), mat = enumName(p.Material), t = r(p.Transparency), shape = p:IsA("Part") and enumName(p.Shape) or nil,
-                mesh = p:IsA("MeshPart") or nil, -- only "this is a mesh part"; the mesh id is NOT saved
+                mesh = p:IsA("MeshPart") or nil,
             })
         end
         return out
@@ -206,7 +207,7 @@ local function main()
     end
     for _, root in ipairs({ ReplicatedStorage, Workspace }) do
         for _, d in ipairs(root:GetDescendants()) do
-            scanned += 1
+            scanned = scanned + 1
             if scanned % 1500 == 0 then task.wait() end
             if (d:IsA("Model") or d:IsA("BasePart")) then
                 for _, pat in ipairs(MODEL_NAME_PATTERNS) do
