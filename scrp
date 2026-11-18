@@ -231,8 +231,15 @@ function A.writeFor(s)
 		geometry.height_y = U.num(geometry.bbox.max[2] - geometry.bbox.min[2])
 		geometry.width_z = U.num(geometry.bbox.max[3] - geometry.bbox.min[3])
 		geometry.merged_with_sessions = oldGeo.merged_with_sessions or {}
-		table.insert(geometry.merged_with_sessions, oldGeo.session)
-		geometry.parts_measured = geometry.parts_measured + (oldGeo.parts_measured or 0)
+		if oldGeo.session ~= Exporter.session then
+			table.insert(geometry.merged_with_sessions, oldGeo.session)
+			geometry.parts_measured = geometry.parts_measured + (oldGeo.parts_measured or 0)
+			geometry.models_measured = geometry.models_measured + (oldGeo.models_measured or 0)
+		else
+			-- a rescan inside the same session replaces the counts of that session instead of adding them
+			geometry.parts_measured = math.max(geometry.parts_measured, oldGeo.parts_measured or 0)
+			geometry.models_measured = math.max(geometry.models_measured, oldGeo.models_measured or 0)
+		end
 	end
 	Exporter.writeJson(s.dir .. "/geometry.json", geometry, { versioned = true, kind = "area_geometry" })
 
@@ -698,15 +705,19 @@ function Rep.exportAll()
 	-- 3 validation of what exists so far
 	local validation = V.run()
 	-- 4 reports
-	local cats = Rep.categories()
-	local cov, gaps = coverage()
-	local missing = Rep.missing(cats, gaps)
+	local okC, cats = pcall(Rep.categories)
+	if not okC then Core.err("status por categoria: " .. tostring(cats)) cats = {} end
+	local okV, cov, gaps = pcall(coverage)
+	if not okV then Core.err("cobertura: " .. tostring(cov)) cov, gaps = { coverage_percent_of_known_universe = "unknown", gaps_exist = true }, {} end
+	local okM, missing = pcall(Rep.missing, cats, gaps)
+	if not okM then Core.err("dados faltantes: " .. tostring(missing)) missing = {} end
 	local dupRows, dupTotal = {}, 0
 	for cat, n in pairs(Store.dups) do dupRows[#dupRows + 1] = { category = cat, skipped_this_session = n, restored_from_previous = Store.restored[cat] or 0 } dupTotal = dupTotal + n end
 	local head = { collector_version = Core.Config.Version, session = Exporter.session, generated_at = U.nowIso() }
 	local function put(rel, doc, kind)
 		for k, v in pairs(head) do doc[k] = doc[k] or v end
-		Exporter.writeJson(rel, doc, { versioned = true, kind = kind })
+		local okP, e = pcall(Exporter.writeJson, rel, doc, { versioned = true, kind = kind })
+		if not okP then Core.err("relatorio " .. rel .. ": " .. tostring(e)) end
 	end
 	put("Reports/missing_data.json", { count = #missing, items = missing }, "report_missing")
 	put("Reports/truncated_objects.json", { count = #Rep.truncatedAll, max_parts_per_model = Core.Config.MaxPartsPerModel, items = Rep.truncatedAll, note = "pecas alem do limite foram CONTADAS aqui, nunca descartadas em silencio" }, "report_truncated")
@@ -714,7 +725,9 @@ function Rep.exportAll()
 	local noPartsListed = {}
 	for i = 1, math.min(200, #Rep.noPartsAll) do noPartsListed[i] = Rep.noPartsAll[i] end
 	put("Reports/duplicates.json", { duplicates_skipped = dupTotal, by_category = dupRows, models_without_parts_total = #Rep.noPartsAll, models_without_parts_listed = #noPartsListed, models_without_parts_omitted = #Rep.noPartsAll - #noPartsListed, models_without_parts = noPartsListed, note = "models without loaded parts are recorded in the models files with measured_status = no_parts; the list here is capped and the omitted count is explicit" }, "report_duplicates")
-	local statusDoc = { categories = cats, worlds = worldStatus(), coverage = cov, never_100_percent_rule = "coverage is capped below 100 while any gap exists" }
+	local okW, wst = pcall(worldStatus)
+	if not okW then Core.err("status dos mundos: " .. tostring(wst)) wst = {} end
+	local statusDoc = { categories = cats, worlds = wst, coverage = cov, never_100_percent_rule = "coverage is capped below 100 while any gap exists" }
 	put("collection_status.json", statusDoc, "status")
 	local counts = {}
 	for cat, n in pairs(Store.counts) do counts[cat] = n end
@@ -829,6 +842,8 @@ local RENDER = {}
 RENDER.dashboard = function()
 	local S = R("SessionManager")
 	local out = { "VERSAO " .. Core.Config.Version .. "   SESSAO " .. tostring(S.id) .. (S.resumed and "  (retomada)" or "") }
+	out[#out + 1] = "COMO USAR: va ate uma area, espere carregar, abra os menus que quiser medir e aperte SALVAR TUDO. Repita em cada area."
+	out[#out + 1] = "O dano das caixas e observado sozinho enquanto voce joga (so grava se medir algo)."
 	out[#out + 1] = "Armazenamento: " .. (Exporter.FS.canWrite() and "writefile OK -> pasta '" .. Core.Config.Root .. "'" or "SEM writefile (so memoria / area de transferencia)")
 	out[#out + 1] = "Operacao: " .. tostring(Core.control.op or "nenhuma") .. (Core.control.paused and " [PAUSADA]" or "")
 	out[#out + 1] = ""
@@ -903,7 +918,7 @@ RENDER.boxes = function()
 	local out = catalogBlock("boxes", "CAIXAS / PRESENTES (agrupados por tipo)")
 	local D = R("DamageObserver")
 	out[#out + 1] = ""
-	out[#out + 1] = D.isActive() and "SESSAO DE DANO ATIVA: bata nas caixas e depois pare no mesmo botao." or "Sessao de dano: inativa"
+	out[#out + 1] = D.isActive() and "Observando o dano das caixas ao seu redor (automatico; so grava se medir algo)." or "Observacao de dano: aguardando personagem"
 	for _, s in ipairs(D.sessions) do out[#out + 1] = string.format("  %s: %d caixas, %d destruidas, %d eventos, %d respawns", s.id, s.boxes_watched, s.destroyed, s.events, s.respawns) end
 	return lines(out)
 end
@@ -970,11 +985,15 @@ RENDER.events = function()
 	return lines(out)
 end
 RENDER.export = function()
+	local snaps = R("SaveInstanceBridge").saved
 	local out = { "Pasta: " .. Core.Config.Root .. "   (writefile: " .. tostring(Exporter.FS.canWrite()) .. ")", "Arquivos gravados nesta sessao: " .. #Exporter.files, "Falhas de gravacao: " .. Exporter.FS.failures, "" }
 	for i = math.max(1, #Exporter.files - 20), #Exporter.files do
 		local f = Exporter.files[i]
 		out[#out + 1] = string.format("  %-9s %6d B  %s", f.kind, f.bytes, string.sub(f.path, 1, 70))
 	end
+	out[#out + 1] = ""
+	out[#out + 1] = "Snapshots .rbxl (SaveInstance oficial, sem scripts): " .. #snaps
+	for _, sn in ipairs(snaps) do out[#out + 1] = "  " .. sn.path .. (sn.found_on_disk == false and "  (NAO ENCONTRADO)" or "") end
 	return lines(out)
 end
 RENDER.reports = function()
@@ -995,21 +1014,21 @@ RENDER.reports = function()
 end
 
 local TABS = {
-	{ id = "dashboard", label = "Dashboard", actions = { "collectAll" } },
-	{ id = "worlds", label = "Mundos", actions = { "mapWorld" } },
-	{ id = "areas", label = "Areas", actions = { "mapArea" } },
-	{ id = "models", label = "Modelos 3D", actions = { "measureModels" } },
-	{ id = "shops", label = "Lojas", actions = { "measureShops" } },
-	{ id = "weapons", label = "Armas", actions = { "measureWeapons" } },
-	{ id = "boxes", label = "Caixas e danos", actions = { "measureBoxes", "damage" } },
-	{ id = "pets", label = "Pets e ovos", actions = { "measurePets", "measureEggs", "event" } },
-	{ id = "economy", label = "Economia", actions = { "event" } },
+	{ id = "dashboard", label = "Dashboard", actions = {} },
+	{ id = "worlds", label = "Mundos", actions = {} },
+	{ id = "areas", label = "Areas", actions = {} },
+	{ id = "models", label = "Modelos 3D", actions = {} },
+	{ id = "shops", label = "Lojas", actions = {} },
+	{ id = "weapons", label = "Armas", actions = {} },
+	{ id = "boxes", label = "Caixas e danos", actions = {} },
+	{ id = "pets", label = "Pets e ovos", actions = {} },
+	{ id = "economy", label = "Economia", actions = {} },
 	{ id = "progression", label = "Progressao", actions = {} },
-	{ id = "ui", label = "Interface do jogo", actions = { "measureUI" } },
-	{ id = "lighting", label = "Iluminacao", actions = { "lighting" } },
-	{ id = "events", label = "Eventos observados", actions = { "event" } },
-	{ id = "export", label = "Exportacao", actions = { "export", "copy", "validate" } },
-	{ id = "reports", label = "Relatorios", actions = { "validate" } },
+	{ id = "ui", label = "Interface do jogo", actions = {} },
+	{ id = "lighting", label = "Iluminacao", actions = {} },
+	{ id = "events", label = "Eventos observados", actions = {} },
+	{ id = "export", label = "Exportacao", actions = {} },
+	{ id = "reports", label = "Relatorios", actions = {} },
 }
 UI.TABS = TABS
 UI.RENDER = RENDER
@@ -1017,7 +1036,7 @@ UI.RENDER = RENDER
 local BUTTON_LABEL = {
 	collectAll = "COLETAR TUDO ACESSIVEL", mapWorld = "MAPEAR MUNDO ATUAL", mapArea = "MAPEAR AREA ATUAL", measureModels = "MEDIR MODELOS", measureShops = "MEDIR LOJAS",
 	measureWeapons = "MEDIR ARMAS", measureBoxes = "MEDIR CAIXAS", measurePets = "MEDIR PETS", measureEggs = "MEDIR OVOS", measureUI = "MEDIR UI", damage = "REGISTRAR DANO (iniciar/parar)",
-	event = "REGISTRAR EVENTO", validate = "VALIDAR DADOS", export = "EXPORTAR", copy = "COPIAR RELATORIO", lighting = "CAPTURAR ILUMINACAO",
+	event = "REGISTRAR EVENTO", validate = "VALIDAR DADOS", export = "EXPORTAR", copy = "COPIAR RELATORIO", lighting = "CAPTURAR ILUMINACAO", saveRbxl = "SALVAR .RBXL (sem scripts)", saveAll = "SALVAR TUDO",
 }
 UI.BUTTON_LABEL = BUTTON_LABEL
 
@@ -1056,7 +1075,7 @@ function UI.build()
 	mk("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
 	mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6) }, body)
 	local actions = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = 1 }, body)
-	mk("UIGridLayout", { CellSize = UDim2.new(0, 210, 0, 34), CellPadding = UDim2.new(0, 6, 0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, actions)
+	mk("UIGridLayout", { CellSize = UDim2.new(1, 0, 0, 46), CellPadding = UDim2.new(0, 6, 0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, actions)
 	local text = mk("TextLabel", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", TextColor3 = TEXT, Font = Enum.Font.Code, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, LayoutOrder = 2 }, body)
 
 	-- footer
@@ -1065,15 +1084,13 @@ function UI.build()
 	corner(barBg, 4)
 	local bar = mk("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = ACCENT, BorderSizePixel = 0 }, barBg)
 	corner(bar, 4)
-	local status = mk("TextLabel", { Position = UDim2.new(0, 8, 0, 18), Size = UDim2.new(1, -270, 0, 40), BackgroundTransparency = 1, Text = "ocioso", TextColor3 = DIM, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true }, footer)
+	local status = mk("TextLabel", { Position = UDim2.new(0, 8, 0, 18), Size = UDim2.new(1, -110, 0, 40), BackgroundTransparency = 1, Text = "ocioso", TextColor3 = DIM, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true }, footer)
 	local function ctl(label, x, color, fn)
 		local b = mk("TextButton", { Position = UDim2.new(1, x, 0, 22), Size = UDim2.new(0, 84, 0, 34), BackgroundColor3 = color, Text = label, TextColor3 = TEXT, Font = Enum.Font.GothamBold, TextSize = 11 }, footer)
 		corner(b, 6)
 		b.MouseButton1Click:Connect(fn)
 		return b
 	end
-	ctl("PAUSAR", -270, Color3.fromRGB(190, 140, 40), function() Main.pause() end)
-	ctl("CONTINUAR", -180, Color3.fromRGB(50, 150, 90), function() Main.resume() end)
 	ctl("CANCELAR", -90, Color3.fromRGB(170, 55, 55), function() Main.cancel() end)
 
 	-- resize handle
@@ -1139,6 +1156,10 @@ function UI.build()
 			end)
 			return
 		end
+		if id == "saveRbxl" then
+			ask(info, { { placeholder = "rotulo do arquivo (ex: World2_Toyland)", default = "" } }, function(label) task.spawn(Main.ops.saveRbxl, label) end)
+			return
+		end
 		if id == "lighting" then
 			ask({ title = "CAPTURAR ILUMINACAO", what = "Lighting, Atmosphere e efeitos de pos-processamento (valores numericos) no local onde voce esta.", wont = "Nao le texturas de ceu." }, { { placeholder = "rotulo (ex: Forest)", default = "" } }, function(label) task.spawn(Main.ops.lighting, label ~= "" and label or nil) end)
 			return
@@ -1171,11 +1192,10 @@ function UI.build()
 		for _, c in ipairs(actions:GetChildren()) do
 			if c:IsA("TextButton") then c:Destroy() end
 		end
-		for i, id in ipairs(tab.actions) do
-			local b = mk("TextButton", { LayoutOrder = i, BackgroundColor3 = ACCENT, Text = BUTTON_LABEL[id] or id, TextColor3 = TEXT, Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true }, actions)
-			corner(b, 6)
-			b.MouseButton1Click:Connect(function() runAction(id) end)
-		end
+		-- the ONE action button (same on every tab)
+		local b = mk("TextButton", { LayoutOrder = 1, BackgroundColor3 = OK, Text = "SALVAR TUDO", TextColor3 = Color3.new(0, 0, 0), Font = Enum.Font.GothamBold, TextSize = 16, TextWrapped = true }, actions)
+		corner(b, 8)
+		b.MouseButton1Click:Connect(function() runAction("saveAll") end)
 		for id, tb in pairs(tabButtons) do tb.BackgroundColor3 = (id == tab.id) and ACCENT or BG end
 		refresh()
 	end
@@ -1497,7 +1517,8 @@ local function summarize(s)
 	return displayed, measured, estimated, destroyedCount
 end
 
-function D.stop()
+function D.stop(opts)
+	opts = opts or {}
 	local s = D.active
 	if not s then return false, "nenhuma sessao de dano ativa" end
 	D.active = nil
@@ -1510,6 +1531,10 @@ function D.stop()
 		end
 	end
 	local displayed, measured, estimated, destroyed = summarize(s)
+	-- automatic sessions only keep a file when something was actually measured (otherwise every walk would leave an empty file)
+	if opts.discardIfEmpty and estimated.damage_per_decrease.n == 0 and destroyed == 0 and #s.respawns == 0 then
+		return true, nil
+	end
 	local doc = {
 		collector_version = Core.Config.Version, session = Exporter.session, kind = "damage_observation", id = s.id, started = s.started, ended = U.nowIso(),
 		duration_seconds = U.num(os.clock() - s.clock0), radius = s.radius, equipped_tool = s.equipped_tool, player_note = s.note, start_position = s.start_position,
@@ -1523,6 +1548,33 @@ function D.stop()
 	Core.info(string.format("sessao de dano %s: %d caixas, %d destruidas, %d eventos, %d respawns medidos", s.id, #s.boxList, destroyed, #s.events, #s.respawns))
 	return true, s.summary
 end
+
+-- passive mode: the observer watches the boxes around the player all the time and re-centres when the player walks away.
+-- A file is written only when a hit / destruction / respawn was measured. Nothing is ever attacked by this tool.
+D.auto = false
+function D.autoStart()
+	if D.auto then return end
+	D.auto = true
+	task.spawn(function()
+		local centre = nil
+		while D.auto do
+			local char = Core.LocalPlayer and Core.LocalPlayer.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if root then
+				if not D.active then
+					local ok = pcall(D.start, { auto = true, note = "sessao automatica" })
+					if ok then centre = root.Position end
+				elseif centre and (root.Position - centre).Magnitude > 40 then
+					pcall(D.stop, { discardIfEmpty = true })
+					local ok = pcall(D.start, { auto = true, note = "sessao automatica" })
+					centre = ok and root.Position or nil
+				end
+			end
+			task.wait(3)
+		end
+	end)
+end
+function D.autoStop() D.auto = false end
 
 return D
 end
@@ -1723,7 +1775,11 @@ end
 
 function V.run()
 	local checks = {}
-	local files = Exporter.files
+	-- binary snapshots (.rbxl) are not JSON: they are listed in the manifest but not decoded here
+	local files = {}
+	for _, f in ipairs(Exporter.files) do
+		if f.kind ~= "snapshot_rbxl" then files[#files + 1] = f end
+	end
 	local decodeFail, utf8Fail, headerFail, countFail, unreadable, checked = {}, {}, {}, {}, {}, 0
 	local idsByKind = {}
 	local dupIds = {}
@@ -1832,7 +1888,13 @@ local t0 = os.clock()
 
 local WORDS = { "coin", "gem", "cash", "money", "gold", "rebirth", "level", "kill", "box", "damage", "multiplier", "luck", "boost", "speed", "pet", "egg", "power", "rank", "xp", "exp", "token", "crystal", "candy", "currency", "stat", "balance" }
 
+local IGNORE = { "OtherApps.Workspace", "RankList", "Highscore", "HighscoreDisplay" }   -- world leaderboards / ranking lists are not the player's economy
+
 local function looksLikeCounter(label)
+	local full = label:GetFullName()
+	for _, pat in ipairs(IGNORE) do
+		if string.find(full, pat, 1, true) then return false end
+	end
 	local cur = label
 	local depth = 0
 	while cur and depth < 4 do
@@ -2091,7 +2153,8 @@ function G.scan(opts)
 	end
 
 	Area.finalize()
-	World.write()
+	local okW, errW = pcall(World.write)
+	if not okW then Core.err("world_info nao gravado: " .. tostring(errW)) end
 	Exporter.flush()
 	local summary = {
 		instances_in_workspace = total, parts_scanned = scannedParts, skipped = skipped, limit_hit = limitHit, streaming = streaming,
@@ -2266,6 +2329,8 @@ Main.INFO = {
 	validate = { title = "VALIDAR DADOS", what = "Le de volta cada arquivo exportado, confere JSON/UTF-8/cabecalhos/contagens/ids unicos e grava Reports/validation.json.", wont = "Itens nao verificaveis ficam NOT_RUN, nunca PASS." },
 	export = { title = "EXPORTAR", what = "Grava tudo que esta pendente, o estado de retomada, relatorios, manifesto e valida. Dados antigos nunca sao sobrescritos em silencio (versoes .bak / nome com sessao).", wont = "Sem writefile os dados ficam na memoria: use COPIAR RELATORIO." },
 	damage = { title = "REGISTRAR DANO", what = "Inicia/encerra uma sessao MANUAL: voce bate nas caixas, o coletor observa atributos/textos de vida, destruicao, respawn e mudancas de economia e separa exibido / medido / estimado.", wont = "O coletor nao ataca. Pare a sessao com o mesmo botao." },
+	saveAll = { title = "SALVAR TUDO", what = "Faz tudo de uma vez a partir de onde voce esta: varre o mundo carregado (modelos, pecas, geometria por area), mede a interface e os menus abertos, captura a iluminacao, monta os catalogos (lojas, armas, caixas, pets, ovos, baus), grava o dano que foi observado, salva um arquivo .rbxl do que esta carregado (SaveInstance oficial, SEM scripts do jogo), valida tudo e exporta.", wont = "Nao compra, nao ataca, nao abre ovos, nao faz rebirth, nao move voce. Baixa e executa o SaveInstance oficial do GitHub (codigo de terceiros): confirme so se confiar. O streaming so carrega o que esta perto de voce: rode em cada area e os arquivos se mesclam sem duplicar." },
+	saveRbxl = { title = "SALVAR .RBXL (sem scripts)", what = "Baixa e executa o SaveInstance OFICIAL (github.com/luau/UniversalSynSaveInstance) e salva o que o seu cliente tem carregado agora em UnboxingSimulatorData/Snapshots/<rotulo>_<sessao>.rbxl.", wont = "Scripts do jogo ficam de fora (LocalScript/Script/ModuleScript ignorados e decompilacao desligada). ATENCAO: isso baixa codigo de terceiros da internet; so confirme se confia nesse repositorio. SafeMode desligado: voce nao e desconectado. So salva o que esta carregado: va ate a area e espere carregar antes." },
 	event = { title = "REGISTRAR EVENTO", what = "Grava no diario (com horario e posicao) uma anotacao sua: ex. 'abri ovo X e saiu Y' (tipo hatch) ou qualquer evento observado.", wont = "Nao executa nada no jogo." },
 }
 
@@ -2279,6 +2344,8 @@ function Main.init(opts)
 	R("EconomyObserver").start()
 	R("ProgressionObserver").start()
 	R("AnimationObserver").start()
+	R("DamageObserver").autoStart()
+	Core.on("status", function(state) if state ~= "busy" then Main.writeLog() end end)
 	Core.info("coletor " .. Core.Config.Version .. " pronto. Observadores passivos ligados (UI, economia, progressao, animacoes).")
 	return Main
 end
@@ -2289,6 +2356,25 @@ local function finish(name, ok, res)
 	pcall(function() session().saveState() end)
 	return ok, res
 end
+
+-- one failing step must not abort the whole operation (the first real-game run lost everything after the scan this way);
+-- only the user's CANCEL stops the chain. Errors are logged and end up in Reports/collector_log_<session>.json
+local function step(label, fn)
+	local ok, err = pcall(fn)
+	if not ok then
+		if tostring(err) == "CANCELLED" then error("CANCELLED", 0) end
+		Core.err(label .. ": " .. tostring(err))
+	end
+	return ok
+end
+
+local function writeLog()
+	local ok, e = pcall(function()
+		Exporter.writeJson("Reports/collector_log_" .. tostring(Exporter.session) .. ".json", { session = Exporter.session, lines = Core.logLines, note = "last 400 log lines (errors and warnings included)" }, { kind = "log", overwrite = true })
+	end)
+	return ok
+end
+Main.writeLog = writeLog
 
 local function scan(radius)
 	local summary = R("GeometryCollector").scan({ radius = radius })
@@ -2324,16 +2410,64 @@ local function currentAreaLabel()
 	return "posicao_atual"
 end
 
+-- every ScreenGui visible now + every menu open right now (with its item cards)
+local function uiNow()
+	local UI = R("UICollector")
+	UI.snapshotAll("estado_atual")
+	for _, m in ipairs(UI.openMenus()) do
+		Core.checkpoint()
+		local ok = pcall(UI.snapshot, "menu_" .. m.name, { m.inst })
+		if ok then
+			local okC, cards = pcall(UI.cards, m.inst)
+			if okC and #cards > 0 then
+				UI.cardsByMenu = UI.cardsByMenu or {}
+				UI.cardsByMenu[m.name] = { path = m.path, cards = cards, time = U.nowIso() }
+			end
+		end
+	end
+end
+
+-- ONE operation that does everything possible from where the player stands:
+-- world scan, UI + open menus, lighting, catalogs, damage observed so far, .rbxl snapshot (no scripts), validation and export.
+-- Run it in every area: files from different runs merge by stable id (no duplicates).
+function Main.ops.saveAll()
+	return Core.runOperation("SALVAR TUDO", function()
+		local total = 7
+		Core.setProgress(0, total, "1/7 varredura do mundo carregado")
+		step("varredura", function() scan(nil) end)
+		Core.setProgress(1, total, "2/7 interface e menus abertos")
+		step("interface", uiNow)
+		Core.setProgress(2, total, "3/7 iluminacao")
+		step("iluminacao", function() lightingHere(currentAreaLabel()) end)
+		Core.setProgress(3, total, "4/7 catalogos (lojas, armas, caixas, pets, ovos, baus)")
+		step("catalogos", catalogs)
+		Core.setProgress(4, total, "5/7 dano observado")
+		step("dano", function()
+			local D = R("DamageObserver")
+			if D.isActive() then
+				D.stop({ discardIfEmpty = true })
+				D.start({ auto = true })
+			end
+		end)
+		Core.setProgress(5, total, "6/7 arquivo .rbxl (sem scripts)")
+		step("rbxl", function() R("SaveInstanceBridge").save(currentAreaLabel()) end)
+		Core.setProgress(6, total, "7/7 validacao e exportacao")
+		local res = R("CollectionReport").exportAll()
+		Core.setProgress(7, total, "concluido")
+		return res
+	end)
+end
+
 function Main.ops.collectAll()
 	return Core.runOperation("COLETAR TUDO", function()
 		Core.setProgress(0, 5, "1/5 varredura do mundo")
-		scan(nil)
+		step("varredura", function() scan(nil) end)
 		Core.setProgress(1, 5, "2/5 interface")
-		pcall(function() R("UICollector").snapshotAll("estado_atual") end)
+		step("interface", function() R("UICollector").snapshotAll("estado_atual") end)
 		Core.setProgress(2, 5, "3/5 iluminacao")
-		lightingHere(currentAreaLabel())
+		step("iluminacao", function() lightingHere(currentAreaLabel()) end)
 		Core.setProgress(3, 5, "4/5 catalogos")
-		catalogs()
+		step("catalogos", catalogs)
 		Core.setProgress(4, 5, "5/5 validacao e exportacao")
 		local res = R("CollectionReport").exportAll()
 		Core.setProgress(5, 5, "concluido")
@@ -2343,16 +2477,16 @@ end
 
 function Main.ops.mapWorld()
 	return Core.runOperation("MAPEAR MUNDO ATUAL", function()
-		scan(nil)
-		lightingHere(currentAreaLabel())
+		step("varredura", function() scan(nil) end)
+		step("iluminacao", function() lightingHere(currentAreaLabel()) end)
 		return R("CollectionReport").exportAll()
 	end)
 end
 
 function Main.ops.mapArea()
 	return Core.runOperation("MAPEAR AREA ATUAL", function()
-		scan(Core.Config.AreaRadius or 350)
-		lightingHere(currentAreaLabel())
+		step("varredura", function() scan(Core.Config.AreaRadius or 350) end)
+		step("iluminacao", function() lightingHere(currentAreaLabel()) end)
 		return R("CollectionReport").exportAll()
 	end)
 end
@@ -2379,22 +2513,7 @@ Main.ops.measurePets = catalogOp("MEDIR PETS", "PetCollector")
 Main.ops.measureEggs = catalogOp("MEDIR OVOS", "EggCollector")
 
 function Main.ops.measureUI()
-	return Core.runOperation("MEDIR UI", function()
-		local UI = R("UICollector")
-		local res = UI.snapshotAll("estado_atual")
-		for _, m in ipairs(UI.openMenus()) do
-			Core.checkpoint()
-			local ok, snap = pcall(UI.snapshot, "menu_" .. m.name, { m.inst })
-			if ok then
-				local okC, cards = pcall(UI.cards, m.inst)
-				if okC and #cards > 0 then
-					UI.cardsByMenu = UI.cardsByMenu or {}
-					UI.cardsByMenu[m.name] = { path = m.path, cards = cards, time = U.nowIso() }
-				end
-			end
-		end
-		return res
-	end)
+	return Core.runOperation("MEDIR UI", uiNow)
 end
 
 function Main.ops.validate()
@@ -2426,6 +2545,12 @@ function Main.ops.event(kind, text)
 	local egg, result = tostring(text or ""):match("^%s*(.-)%s*=%s*(.-)%s*$")
 	if kind == "hatch" and egg and result and egg ~= "" and result ~= "" then data = { egg = egg, result = result, note = text } end
 	return I.record(kind or "manual", data, "manual")
+end
+
+function Main.ops.saveRbxl(label)
+	return Core.runOperation("SALVAR RBXL", function()
+		return R("SaveInstanceBridge").save(label ~= "" and label or currentAreaLabel())
+	end)
 end
 
 function Main.ops.lighting(label)
@@ -2833,6 +2958,67 @@ function P.write()
 end
 
 return P
+end
+
+Modules["SaveInstanceBridge"] = function(...)
+-- SaveInstanceBridge: optional "save what is loaded as .rbxl" using the OFFICIAL UniversalSynSaveInstance (github.com/luau/UniversalSynSaveInstance).
+-- It downloads and runs that code ONLY when the user presses the button and confirms the explanation.
+-- Game scripts are excluded: the options below skip every LocalScript / Script / ModuleScript and disable decompiling.
+local Core, R = ...
+local U = R("Util")
+local Exporter = R("DataExporter")
+local B = {}
+
+B.URL = "https://raw.githubusercontent.com/luau/UniversalSynSaveInstance/main/saveinstance.luau"
+B.saved = {}   -- { label, path, time }
+
+local function exists(path)
+	local f = Core.ENV.isfile or isfile
+	if type(f) ~= "function" then return nil end
+	local ok, v = pcall(f, path)
+	return ok and v == true
+end
+
+function B.options(path)
+	return {
+		noscripts = true,                 -- alias of Decompile = false
+		ReadMe = false,                   -- no README script inside the file
+		SafeMode = false,                 -- SafeMode would disconnect the player while saving
+		IgnoreDefaultPlayerScripts = true,
+		IgnoreList = { "CoreGui", "CorePackages", "LocalScript", "Script", "ModuleScript", Packages = false }, -- scripts are not part of the snapshot
+		FilePath = path,                  -- the library adds .rbxl; an existing file of the same name is replaced, so the name carries the session id
+	}
+end
+
+function B.save(label)
+	label = U.sanitize(label or "snapshot")
+	local root = Core.Config.Root .. "/Snapshots"
+	local mk = Core.ENV.makefolder or makefolder
+	if type(mk) == "function" then
+		pcall(mk, Core.Config.Root)
+		pcall(mk, root)
+	end
+	local ok, src = pcall(function() return game:HttpGet(B.URL, true) end)
+	if not ok or type(src) ~= "string" or #src < 1000 then
+		error("nao foi possivel baixar o SaveInstance oficial: " .. tostring(src))
+	end
+	local fn, err = loadstring(src, "saveinstance")
+	if not fn then error("SaveInstance invalido: " .. tostring(err)) end
+	local okRun, synsave = pcall(fn)
+	if not okRun or type(synsave) ~= "function" then error("SaveInstance nao retornou funcao: " .. tostring(synsave)) end
+	local path = root .. "/" .. label .. "_" .. tostring(Exporter.session)
+	Core.info("salvando " .. path .. ".rbxl (scripts do jogo excluidos)...")
+	synsave(B.options(path))
+	local file = path .. ".rbxl"
+	local stored = exists(file)
+	B.saved[#B.saved + 1] = { label = label, path = file, time = U.nowIso(), found_on_disk = stored }
+	Exporter.files[#Exporter.files + 1] = { path = file, kind = "snapshot_rbxl", records = 1, bytes = 0, session = Exporter.session, time = U.nowIso(), stored = stored == true }
+	if stored == false then Core.warn("o arquivo " .. file .. " nao foi encontrado depois de salvar (veja o status do SaveInstance na tela)") end
+	return { path = file, found_on_disk = stored }
+end
+
+return B
+
 end
 
 Modules["SessionManager"] = function(...)
@@ -3337,7 +3523,9 @@ function UI.cards(root)
 	return out
 end
 
--- visible frames that look like an open menu: large, opaque-ish, not the whole screen
+-- visible frames that look like an open menu/page: large and not the whole screen. Only VISIBLE subtrees are walked (depth <= 6).
+-- (First real-game run: pages live deep inside MainScreen.Center.ActivePage and are transparent containers, so the old
+-- "depth <= 3 and opaque" rule only ever saw MoreList.) Whether a candidate has real content is checked when it appears.
 local function menuCandidates()
 	local pg = playerGui()
 	local found = {}
@@ -3346,13 +3534,12 @@ local function menuCandidates()
 	local area = vp.X * vp.Y
 	local minFrac = Core.Config.UIMinFrameFraction
 	local function consider(g, depth)
-		if depth > 3 then return end
+		if depth > 6 then return end
 		for _, c in ipairs(g:GetChildren()) do
-			if c:IsA("GuiObject") and c.Name ~= OWN then
-				if c.Visible and (c:IsA("Frame") or c:IsA("ImageLabel") or c:IsA("ScrollingFrame")) then
+			if c:IsA("GuiObject") and c.Name ~= OWN and c.Visible then
+				if c:IsA("Frame") or c:IsA("ImageLabel") or c:IsA("ScrollingFrame") or c:IsA("CanvasGroup") then
 					local frac = (c.AbsoluteSize.X * c.AbsoluteSize.Y) / area
-					local opaque = c.BackgroundTransparency < 0.95 or c:IsA("ImageLabel")
-					if frac >= minFrac and frac <= 0.9 and opaque then
+					if frac >= minFrac and frac <= 0.98 then
 						found[U.path(c)] = c
 					end
 				end
@@ -3395,11 +3582,33 @@ function UI.watch(on)
 					previous = current
 					for path in pairs(current) do UI.captured[path] = UI.captured[path] or "baseline" end
 				else
+					-- newly visible candidates; when a candidate and its ancestor are both new, only the topmost one is a "menu"
+					local newOnes, newSet = {}, {}
 					for path, g in pairs(current) do
 						if not previous[path] then
+							newOnes[#newOnes + 1] = { path = path, g = g }
+							newSet[g] = true
+						end
+					end
+					for _, item in ipairs(newOnes) do
+						local path, g = item.path, item.g
+						local hasNewAncestor = false
+						local anc = g.Parent
+						while anc and anc ~= game do
+							if newSet[anc] then hasNewAncestor = true break end
+							anc = anc.Parent
+						end
+						local contentCount = 0
+						if not hasNewAncestor then
+							for _, d in ipairs(g:GetDescendants()) do
+								if d:IsA("GuiObject") then contentCount = contentCount + 1 end
+								if contentCount >= 8 then break end
+							end
+						end
+						if not hasNewAncestor and contentCount >= 8 then
 							UI.menuLog[#UI.menuLog + 1] = { t = U.nowIso(), kind = "opened", name = g.Name, path = path }
 							eventHook("ui_opened", { name = g.Name, path = path })
-							if Core.Config.AutoUISnapshot and not UI.captured[path] then
+							if Core.Config.AutoUISnapshot and not UI.captured[path] and #UI.snapshots < Core.Config.MaxAutoSnapshots then
 								UI.captured[path] = true
 								task.wait(0.7) -- let the opening animation finish before measuring
 								local sg = screenGuiOf(g)
@@ -3426,7 +3635,7 @@ function UI.watch(on)
 					previous = current
 				end
 			end
-			task.wait(Core.Config.SampleInterval * 2)
+			task.wait(Core.Config.SampleInterval * 4)
 		end
 	end)
 end
@@ -3704,11 +3913,12 @@ local W = {}
 W.worlds = {}   -- name -> info
 
 local function childrenSummary(inst, limit)
+	limit = limit or 200   -- (bug fixed after the first real-game run: a nil limit crashed worlds with more than 200 direct children)
 	local list = {}
 	local ok, kids = pcall(function() return inst:GetChildren() end)
 	if not ok then return list end
 	for i, c in ipairs(kids) do
-		if i > (limit or 200) then
+		if i > limit then
 			list[#list + 1] = { name = "...", class = "truncated", note = (#kids - limit) .. " more children not listed" }
 			break
 		end
@@ -3809,7 +4019,7 @@ function W.write()
 			end
 		end
 		if #zones > 0 then
-			Exporter.writeJson(dir .. "/geometry.json", {
+			Exporter.writeJson(dir .. "/world_geometry.json", {
 				collector_version = Core.Config.Version, session = Exporter.session, world = name, zones = zones,
 				bbox = { min = { U.num(min[1]), U.num(min[2]), U.num(min[3]) }, max = { U.num(max[1]), U.num(max[2]), U.num(max[3]) } },
 			}, { versioned = true, kind = "world_geometry" })
@@ -3845,6 +4055,7 @@ Core.Config = {
 	MaxUINodes = 20000,
 	SampleInterval = 0.25,     -- observers sample the screen this often (seconds)
 	MaxEvents = 5000,
+	MaxAutoSnapshots = 60,      -- menus measured automatically per session (each opening of a NEW menu = 1 snapshot)
 	AreaRadius = 350,           -- radius used by MAPEAR AREA ATUAL / MEDIR *
 	IncludePlayerIdentity = false, -- player name / user id are NOT written to the export unless this is set to true
 }
