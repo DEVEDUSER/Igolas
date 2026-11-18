@@ -13,9 +13,9 @@ local typeof = ENV.UBG_TYPEOF or typeof
 if not TEST and type(ENV.UBG_CLEANUP) == "function" then pcall(ENV.UBG_CLEANUP) end
 
 local CFG = {
-	VERSION = "1.0.0", OUT = "UnboxingGap",
+	VERSION = "1.0.1", OUT = "UnboxingGap",
 	SLICE = 0.006,
-	UI_MAX_NODES = 6000, UI_MIN_FRAC = 0.18, UI_SETTLE = 0.6, UI_SCAN = 0.7,
+	UI_MAX_NODES = 6000, UI_MIN_NODES = 6, UI_MIN_FRAC = 0.18, UI_SETTLE = 0.6, UI_SCAN = 0.7,
 	BOX_RADIUS = 80, BOX_SCAN = 1.5, BOX_EVENT_CAP = 600, BOX_TOTAL_CAP = 40000, BOX_WATCH_PER = 60,
 	MAP_RADIUS = 300, MAP_CELL = 100, MAP_MAX = 40000, MAP_CHUNK = 800,
 	LEDGER_CAP = 30000, WATCH_CAP = 600, RATE_PER_SEC = 25, REWARD_WINDOW = 2.5, INPUT_CAP = 3000,
@@ -152,14 +152,41 @@ local CHECK = {
 	{ "craft", "Crafting", { "craft", "recipe" } }, { "merchant", "Merchant", { "merchant" } }, { "dungeon", "Dungeon", { "dungeon" } },
 	{ "weather", "Weather", { "weather" } }, { "wheel", "Ticket wheel", { "wheel", "spin", "ticket" } }, { "chest", "Chests", { "chest" } },
 	{ "event", "Halloween / event", { "halloween", "event" } }, { "potion", "Potions", { "potion" } }, { "more", "More menu", { "morelist", "more" } },
+	{ "teleport", "Teleport / travel", { "teleport" } },
 }
 Core.CHECK = CHECK
 Core.checkState = {}
 for _, c in ipairs(CHECK) do Core.checkState[c[1]] = { auto = 0, manual = false, samples = {} } end
 
--- looks only at the container path and title-like texts (never at the whole HUD, which lists every button name)
-function Core.matchChecklist(pathNames, titles)
-	local hay = string.lower(table.concat(pathNames or {}, ".") .. "." .. table.concat(titles or {}, "."))
+-- Panels that are effects/overlays, never menus (first real run: fade bars and a starburst were captured as "menus")
+local DENY_PANEL = { "screenfade", "starburst", "shinesweep", "glow" }
+function Core.isDeniedPanel(name)
+	local l = string.lower(tostring(name))
+	for _, w in ipairs(DENY_PANEL) do
+		if string.find(l, w, 1, true) then return true end
+	end
+	return false
+end
+-- cheap content signature: node count + a rolling checksum over texts; equal signatures = same panel content
+function Core.snapSig(nodes)
+	local s = #nodes
+	for _, r in ipairs(nodes) do
+		local t = r.text
+		if t then s = (s * 31 + #t + (string.byte(t, 1) or 0)) % 2147483647 end
+	end
+	return tostring(#nodes) .. ":" .. tostring(s)
+end
+
+-- looks at the container path (last segments) and the names of its visible direct children; never at texts, never at the whole HUD
+function Core.matchChecklist(pathNames, childNames)
+	local keep = {}
+	for _, seg in ipairs(pathNames or {}) do
+		if not Core.isDeniedPanel(seg) and not string.find(string.lower(seg), "token", 1, true) then keep[#keep + 1] = seg end
+	end
+	for _, nm in ipairs(childNames or {}) do
+		if not Core.isDeniedPanel(nm) then keep[#keep + 1] = nm end
+	end
+	local hay = string.lower(table.concat(keep, "."))
 	local hits = {}
 	for _, c in ipairs(CHECK) do
 		for _, w in ipairs(c[3]) do
@@ -218,7 +245,8 @@ function Core.nodeRecord(n, rel)
 	if type(lo) == "number" and lo ~= 0 then r.lo = lo end
 	if n:IsA("GuiObject") then
 		r.pos = U.v2(rd(n, "AbsolutePosition")); r.sz = U.v2(rd(n, "AbsoluteSize"))
-		r.P = U.ud2(rd(n, "Position")); r.S = U.ud2(rd(n, "Size"))
+		-- keys "up"/"us" (not P/S): JSON readers that ignore key case would collide with "p" (path)
+		r.up = U.ud2(rd(n, "Position")); r.us = U.ud2(rd(n, "Size"))
 		local anc = rd(n, "AnchorPoint")
 		if typeof(anc) == "Vector2" and (anc.X ~= 0 or anc.Y ~= 0) then r.anc = U.v2(anc) end
 		r.bg = U.c3(rd(n, "BackgroundColor3")); r.bgt = U.num(rd(n, "BackgroundTransparency"))
@@ -320,6 +348,7 @@ function Core.planFiles(D, sid, extra)
 	addChunks("map_prompts", D.map.prompts, CFG.CHUNK)
 	addChunks("map_models", D.map.meta, CFG.CHUNK)
 	addChunks("board_texts", D.board, CFG.CHUNK * 4)
+	addChunks("log", D.log, 400)
 	local pathsDoc = hdr("map_paths"); pathsDoc.paths = D.map.paths
 	files[#files + 1] = { name = "map_paths.json", doc = pathsDoc }
 	local sum = hdr("summary")
@@ -329,7 +358,7 @@ function Core.planFiles(D, sid, extra)
 end
 
 Core.D = {
-	ui = {}, tags = {}, inputs = {}, boxes = {}, board = {},
+	ui = {}, tags = {}, inputs = {}, boxes = {}, board = {}, log = {},
 	ledger = Ledger,
 	map = { byArea = {}, prompts = {}, meta = {}, paths = {}, count = 0 },
 }
@@ -369,6 +398,7 @@ local Stats = { suffix_seen = {}, writes = 0, write_errors = {}, scans = { ui = 
 local logLines, logLabel, statusLabel = {}, nil, nil
 local function log(msg)
 	print("[UBG] " .. tostring(msg))
+	if #D.log < 1500 then D.log[#D.log + 1] = { c = num(Core.clock()), m = U.clean(tostring(msg)) } end
 	logLines[#logLines + 1] = tostring(msg)
 	if #logLines > 6 then table.remove(logLines, 1) end
 	if logLabel then pcall(function() logLabel.Text = table.concat(logLines, "\n") end) end
@@ -463,6 +493,7 @@ local function scanWatchers()
 	end
 end
 local playerAttrOld = {}
+local evalGui -- forward declaration: defined in the boxes section
 local function startPlayerAttrs()
 	for k, v in pairs(LocalPlayer:GetAttributes()) do playerAttrOld[k] = v end
 	connect(LocalPlayer.AttributeChanged, function(name)
@@ -473,6 +504,16 @@ local function startPlayerAttrs()
 	connect(LocalPlayer.DescendantAdded, function(d) if d:IsA("ValueBase") then registerValue(d) end end)
 	connect(PlayerGui.DescendantAdded, function(d)
 		if d:IsA("TextLabel") and labelMatches(d) then registerText(d) end
+		if d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+			-- box health bars appear (or get re-adorned) while you hit; wait a moment so Adornee is set
+			tspawn(function()
+				twait(0.15)
+				if alive and not isMine(d) then
+					pcall(evalGui, d)
+					connect(d:GetPropertyChangedSignal("Adornee"), function() pcall(evalGui, d) end)
+				end
+			end)
+		end
 	end)
 end
 
@@ -507,25 +548,33 @@ local function viewport()
 	if cam then return cam.ViewportSize end
 	return Vector2.new(800, 400)
 end
+local lastSig = {}
 local function capturePanel(node, forced)
 	local pathNames = {}
 	for seg in string.gmatch(relPath(node, PlayerGui), "[^%.]+") do pathNames[#pathNames + 1] = seg end
 	local label = relPath(node, PlayerGui)
+	if Core.isDeniedPanel(node.Name) then covered[node] = true; return end
 	local snap = Core.snapshotTree(node, { yield = slice, covered = covered, maxNodes = CFG.UI_MAX_NODES })
-	local titles = {}
+	if snap.node_count < CFG.UI_MIN_NODES then return end -- trivial overlay (fade bar, glow...)
+	local sig = Core.snapSig(snap.nodes)
+	if lastSig[label] == sig then
+		if forced then log("UI igual a antes, ignorada: " .. label) end
+		return
+	end
+	lastSig[label] = sig
+	local children = {}
 	for _, r in ipairs(snap.nodes) do
-		if r.text and #titles < 12 then
-			local lp = string.lower(r.p or "")
-			if string.find(lp, "title", 1, true) or string.find(lp, "header", 1, true) then titles[#titles + 1] = r.text end
-		end
+		-- visible direct children of the panel (e.g. "Inventory", "TeleportMenu" under ActivePage) identify which menu is open
+		if not r.hidden and r.p ~= "" and not string.find(r.p, "/", 1, true) and not string.find(r.c or "", "^UI") then children[#children + 1] = r.p end
 	end
 	local lastThree = {}
 	for i = math.max(1, #pathNames - 2), #pathNames do lastThree[#lastThree + 1] = pathNames[i] end
-	local hits = Core.matchChecklist(lastThree, titles)
+	local hits = Core.matchChecklist(lastThree, children)
 	Core.markChecklist(hits, label)
 	local vp = viewport()
 	D.ui[#D.ui + 1] = { gap_version = CFG.VERSION, session = SID, kind = "ui_snapshot", label = label, forced = forced or nil, clock = num(Core.clock()), ts = U.nowIso(),
-		viewport = { n0(vp.X), n0(vp.Y) }, node_count = snap.node_count, hidden_count = snap.hidden_count, truncated = snap.truncated, matched = hits, nodes = snap.nodes }
+		viewport = { n0(vp.X), n0(vp.Y) }, node_count = snap.node_count, hidden_count = snap.hidden_count, truncated = snap.truncated, matched = hits,
+		visible_children = children, nodes = snap.nodes }
 	Stats.scans.ui = Stats.scans.ui + 1
 	log("UI medida: " .. label .. " (" .. snap.node_count .. " nos" .. (#hits > 0 and (", ticks: " .. table.concat(hits, ",")) or "") .. ")")
 	refreshGui()
@@ -587,6 +636,8 @@ end
 ------------------------------------------------------------------------------------------------- boxes
 local boxes, boxCount, boxTotal, destroyedCount = setmetatable({}, { __mode = "k" }), 0, 0, 0
 local boxOn = true
+local guiSeen = setmetatable({}, { __mode = "k" })
+local scanNo = 0
 local function boxEvent(b, kind, data)
 	if boxTotal >= CFG.BOX_TOTAL_CAP then return end
 	if #b.events >= CFG.BOX_EVENT_CAP then b.dropped = (b.dropped or 0) + 1; return end
@@ -600,87 +651,136 @@ local function dist3(a, b)
 	local dx, dy, dz = a[1] - b[1], a[2] - b[2], a[3] - b[3]
 	return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
-local function watchBox(model, cls)
-	if boxes[model] then return end
+local function instPos(inst)
+	if inst:IsA("BasePart") then return inst.Position end
+	if inst:IsA("Model") then
+		local ok, pv = pcall(function() return inst:GetPivot() end)
+		if ok then return pv.Position end
+	end
+	return nil
+end
+local function closeBox(b, how)
+	if b.ended then return end
+	b.ended = num(Core.clock())
+	b.end_how = how
+	local d = dist3(rootPos(), b.pos)
+	if d and d > CFG.BOX_RADIUS * 1.15 then
+		boxEvent(b, "gone_far", { dist = num(d), how = how }) -- streamed out / player walked away: not a break
+	else
+		destroyedCount = destroyedCount + 1
+		boxEvent(b, "destroyed", { dist = d and num(d) or nil, how = how })
+		Ledger.openWindow(b.reward)
+	end
+end
+-- the game keeps live boxes as nameless MeshParts in a nameless Folder under Workspace, tagged with attributes BoxType/Currency/Size
+local function watchBox(inst, kind)
+	if boxes[inst] then return end
 	boxCount = boxCount + 1
-	local b = { id = boxCount, name = model.Name, kind = cls, path = relPath(model, Workspace), first = num(Core.clock()), events = {}, reward = {} }
-	local okp, pv = pcall(function() return model:GetPivot() end)
-	if okp then b.pos = U.v3(pv.Position); b.cf = U.cf6(pv) end
-	local oks, ext = pcall(function() return model:GetExtentsSize() end)
-	if oks then b.size = U.v3(ext) end
-	b.attrs = U.attributes(model)
+	local b = { id = boxCount, name = inst.Name, kind = kind, path = relPath(inst, Workspace), first = num(Core.clock()), events = {}, reward = {}, nwatch = 0 }
+	local pos = instPos(inst)
+	if pos then b.pos = U.v3(pos) end
+	if inst:IsA("BasePart") then
+		b.cf = U.cf6(inst.CFrame); b.size = U.v3(inst.Size); b.transparency = U.num(inst.Transparency)
+		b.class = inst.ClassName
+	end
+	b.attrs = U.attributes(inst)
 	b.tool = equipped(); b.player_pos = rootPos(); b.player_attrs = U.attributes(LocalPlayer)
-	boxes[model] = b
+	boxes[inst] = b
 	D.boxes[#D.boxes + 1] = b
-	connect(model.AttributeChanged, function(name) boxEvent(b, "attr", { name = name, v = U.encodeSimple(model:GetAttribute(name)) }) end)
-	local watched = 0
-	for _, d in ipairs(model:GetDescendants()) do
-		if watched >= CFG.BOX_WATCH_PER then break end
-		if d:IsA("TextLabel") then
-			watched = watched + 1
-			connect(d:GetPropertyChangedSignal("Text"), function()
-				local tx = rd(d, "Text")
-				local pr = U.parseDisplay(tx, Stats.suffix_seen)
-				boxEvent(b, "text", { label = d.Name, text = U.clean(tx), a = pr and pr.approx })
-			end)
-		elseif d:IsA("Frame") and (d:FindFirstAncestorOfClass("BillboardGui") or d:FindFirstAncestorOfClass("SurfaceGui")) then
-			watched = watched + 1
-			connect(d:GetPropertyChangedSignal("Size"), function() boxEvent(b, "bar", { name = d.Name, s = U.ud2(rd(d, "Size")) }) end)
-		elseif d:IsA("ValueBase") then
-			watched = watched + 1
+	connect(inst.AttributeChanged, function(name) boxEvent(b, "attr", { name = name, v = U.encodeSimple(inst:GetAttribute(name)) }) end)
+	if inst:IsA("BasePart") then
+		connect(inst:GetPropertyChangedSignal("Transparency"), function() boxEvent(b, "transparency", { v = U.num(rd(inst, "Transparency")) }) end)
+		connect(inst:GetPropertyChangedSignal("Size"), function() boxEvent(b, "size", { v = U.v3(rd(inst, "Size")) }) end)
+		connect(inst:GetPropertyChangedSignal("Position"), function() boxEvent(b, "moved", { v = U.v3(rd(inst, "Position")) }) end)
+	end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if b.nwatch >= CFG.BOX_WATCH_PER then break end
+		if d:IsA("ValueBase") then
+			b.nwatch = b.nwatch + 1
 			connect(d:GetPropertyChangedSignal("Value"), function() boxEvent(b, "value", { name = d.Name, v = U.encodeSimple(rd(d, "Value")) }) end)
 		elseif d:IsA("Humanoid") then
-			watched = watched + 1
+			b.nwatch = b.nwatch + 1
 			connect(d:GetPropertyChangedSignal("Health"), function() boxEvent(b, "health", { v = num(rd(d, "Health")), max = num(rd(d, "MaxHealth")) }) end)
 		end
 	end
-	connect(model.AncestryChanged, function(_, parent)
-		if parent == nil and not b.ended then
-			b.ended = num(Core.clock())
-			local d = dist3(rootPos(), b.pos)
-			if d and d > CFG.BOX_RADIUS * 1.15 then
-				boxEvent(b, "gone_far", { dist = num(d) })
-			else
-				destroyedCount = destroyedCount + 1
-				boxEvent(b, "destroyed", { dist = d and num(d) or nil })
-				Ledger.openWindow(b.reward)
-			end
-		end
+	connect(inst.AncestryChanged, function(_, parent)
+		if parent == nil then closeBox(b, "removed") end
 	end)
 	boxEvent(b, "watching", { pos = b.pos })
+	log("caixa " .. b.id .. " (" .. tostring(kind) .. ") " .. (b.attrs and b.attrs.Currency and tostring(b.attrs.Currency) or ""))
 end
-local function boxModelOf(p)
-	local cur = p
-	for _ = 1, 4 do
-		if not cur or cur == Workspace then return nil end
-		if cur:IsA("Model") then
-			local cls = Core.classifyBox(cur.Name)
-			if cls then return cur, cls end
+-- health bars / labels of a box are BillboardGui or SurfaceGui under PlayerGui whose Adornee is the box
+local function attachGui(gui, b)
+	if guiSeen[gui] then return end
+	guiSeen[gui] = true
+	b.gui = relPath(gui, PlayerGui)
+	b.gui_initial = {}
+	for _, d in ipairs(gui:GetDescendants()) do
+		if b.nwatch >= CFG.BOX_WATCH_PER then break end
+		local rel = relPath(d, gui)
+		if d:IsA("TextLabel") or d:IsA("TextButton") then
+			b.nwatch = b.nwatch + 1
+			b.gui_initial[rel] = U.clean(rd(d, "Text"))
+			connect(d:GetPropertyChangedSignal("Text"), function()
+				local tx = rd(d, "Text")
+				local pr = U.parseDisplay(tx, Stats.suffix_seen)
+				boxEvent(b, "gtext", { label = rel, text = U.clean(tx), a = pr and pr.approx })
+			end)
+		elseif d:IsA("GuiObject") then
+			b.nwatch = b.nwatch + 1
+			b.gui_initial[rel] = U.ud2(rd(d, "Size"))
+			connect(d:GetPropertyChangedSignal("Size"), function() boxEvent(b, "gbar", { name = rel, us = U.ud2(rd(d, "Size")) }) end)
 		end
-		cur = cur.Parent
 	end
-	return nil
+	boxEvent(b, "gui", { path = b.gui })
+end
+evalGui = function(gui)
+	local ad = rd(gui, "Adornee")
+	if ad and boxes[ad] then attachGui(gui, boxes[ad]) end
+end
+local function scanGuis()
+	for _, d in ipairs(PlayerGui:GetDescendants()) do
+		if (d:IsA("BillboardGui") or d:IsA("SurfaceGui")) and not guiSeen[d] and not isMine(d) then evalGui(d) end
+		slice()
+	end
+end
+local function considerBox(inst, rpos)
+	if boxes[inst] then return end
+	local ok, bt = pcall(function() return inst:GetAttribute("BoxType") end)
+	if not ok or bt == nil then return end
+	local pos = instPos(inst)
+	if not pos or (pos - rpos).Magnitude > CFG.BOX_RADIUS then return end
+	watchBox(inst, tostring(bt))
 end
 local function scanBoxes()
 	local root = rootPart()
 	if not root then return end
-	local params = OverlapParams.new()
-	local worlds = Workspace:FindFirstChild("Worlds")
-	if worlds then
-		params.FilterType = Enum.RaycastFilterType.Include
-		params.FilterDescendantsInstances = { worlds }
-	else
+	local rpos = root.Position
+	scanNo = scanNo + 1
+	-- 1) cheap: every Folder directly under Workspace, one level down (live boxes are kept there)
+	for _, f in ipairs(Workspace:GetChildren()) do
+		if f:IsA("Folder") then
+			for _, c in ipairs(f:GetChildren()) do considerBox(c, rpos) end
+			slice()
+		end
+	end
+	-- 2) fallback every 5th scan: spatial query, in case boxes also exist elsewhere (Models or other containers)
+	if scanNo % 5 == 1 then
+		local params = OverlapParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		params.FilterDescendantsInstances = { LocalPlayer.Character }
+		params.MaxParts = 1500
+		local ok, parts = pcall(function() return Workspace:GetPartBoundsInRadius(rpos, CFG.BOX_RADIUS, params) end)
+		if ok then
+			for _, p in ipairs(parts) do
+				considerBox(p, rpos)
+				local m = p.Parent
+				if m and m:IsA("Model") then considerBox(m, rpos) end
+			end
+		end
 	end
-	params.MaxParts = 1500
-	local ok, parts = pcall(function() return Workspace:GetPartBoundsInRadius(root.Position, CFG.BOX_RADIUS, params) end)
-	if not ok then return end
 	Stats.scans.box = Stats.scans.box + 1
-	for _, p in ipairs(parts) do
-		local m, cls = boxModelOf(p)
-		if m then watchBox(m, cls) end
-	end
+	if scanNo % 4 == 2 and #D.boxes > 0 then scanGuis() end
 end
 
 ------------------------------------------------------------------------------------------------- map
@@ -778,6 +878,7 @@ local function scanMap()
 	local root = rootPart()
 	if not root then log("MAPA: sem personagem"); return end
 	mapBusy = true
+	log("MAPA: iniciando, raio " .. CFG.MAP_RADIUS .. " ao redor de " .. string.format("%.0f,%.0f,%.0f", root.Position.X, root.Position.Y, root.Position.Z))
 	local ok, err = pcall(function()
 		local params = OverlapParams.new()
 		local worlds = Workspace:FindFirstChild("Worlds")
@@ -809,6 +910,7 @@ local function scanMap()
 				z = z + cell
 			end
 			x = x + cell
+			log("MAPA: coluna x=" .. tostring(x) .. " | pecas ate agora: " .. tostring(added))
 		end
 		Stats.scans.map = Stats.scans.map + 1
 		Stats.map_saturated_cells = (Stats.map_saturated_cells or 0) + saturated
