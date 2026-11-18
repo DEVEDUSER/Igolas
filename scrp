@@ -15,12 +15,12 @@ local typeof = ENV.UBG_TYPEOF or typeof
 if not TEST and type(ENV.UBG_CLEANUP) == "function" then pcall(ENV.UBG_CLEANUP) end
 
 local CFG = {
-	VERSION = "2.0.0", OUT = "UnboxingGap",
+	VERSION = "2.0.2", OUT = "UnboxingGap",
 	SLICE = 0.006,
 	UI_MAX_NODES = 6000, UI_MIN_NODES = 6, UI_MIN_FRAC = 0.18, UI_SETTLE = 0.35, UI_SCAN = 0.7,
 	BOX_RADIUS = 80, BOX_SCAN = 1.5, BOX_EVENT_CAP = 600, BOX_TOTAL_CAP = 60000, BOX_WATCH_PER = 60,
 	MAP_RADIUS = 300, MAP_CELL = 100, MAP_MAX = 150000, MAP_CHUNK = 800, MAP_AUTO_MOVE = 150, MAP_AUTO_GAP = 25,
-	LEDGER_CAP = 60000, WATCH_CAP = 600, RATE_PER_SEC = 25, REWARD_WINDOW = 2.5, CLICK_CAP = 6000,
+	LEDGER_CAP = 60000, WATCH_CAP = 1000, WATCH_HARD_CAP = 3000, RATE_PER_SEC = 25, REWARD_WINDOW = 2.5, CLICK_CAP = 6000,
 	AUTOSAVE = 60, CHUNK = 250,
 }
 
@@ -154,7 +154,7 @@ local CHECK = {
 	{ "craft", "Crafting", { "craft", "recipe" } }, { "merchant", "Merchant", { "merchant" } }, { "dungeon", "Dungeon", { "dungeon" } },
 	{ "weather", "Weather", { "weather" } }, { "wheel", "Wheel", { "wheel", "spin", "ticket" } }, { "chest", "Chests", { "chest" } },
 	{ "event", "Event", { "halloween", "event" } }, { "potion", "Potions", { "potion" } }, { "more", "More", { "morelist", "more" } },
-	{ "teleport", "Teleport", { "teleport" } },
+	{ "teleport", "Teleport", { "teleport" } }, { "achievements", "Achievements", { "achievement" } },
 }
 Core.CHECK = CHECK
 Core.checkState = {}
@@ -452,10 +452,13 @@ local function parsedPair(old, new)
 	return { o = po and po.approx, n = pn and pn.approx }
 end
 local function registerText(label)
-	if Watch.seen[label] or Watch.count >= CFG.WATCH_CAP or isMine(label) then return end
+	if Watch.seen[label] or isMine(label) then return end
+	local key = relPath(label, PlayerGui)
+	-- v2.0.0 hit the 600 cap on menu labels and never watched the Halloween EventCurrency: wallet/currency labels bypass the normal cap
+	local priority = string.find(key, "Currenc", 1, true) or string.find(key, "Wallet", 1, true) or string.find(key, "StorageMagnet", 1, true)
+	if Watch.count >= (priority and CFG.WATCH_HARD_CAP or CFG.WATCH_CAP) then return end
 	Watch.seen[label] = true
 	Watch.count = Watch.count + 1
-	local key = relPath(label, PlayerGui)
 	local old = rd(label, "Text")
 	Watch.last[key] = U.clean(old)
 	connect(label:GetPropertyChangedSignal("Text"), function()
@@ -537,16 +540,20 @@ local function startClicks()
 		local rec = { c = num(Core.clock()), t = U.enumName(t), x = n0(pos.X), y = n0(pos.Y), gp = gp and true or false, ctx = Core.state.ctx, area = Core.state.area }
 		local ok, objs = pcall(function() return PlayerGui:GetGuiObjectsAtPosition(pos.X, pos.Y) end)
 		if ok and type(objs) == "table" then
-			local hits = {}
-			for i = 1, math.min(#objs, 4) do
+			-- real buttons first: a tap on the world usually has a huge transparent container (SideMenu) on top of the list
+			local btns, others = {}, {}
+			for i = 1, math.min(#objs, 12) do
 				local o = objs[i]
 				if not isMine(o) then
 					local h = { p = relPath(o, PlayerGui), c = o.ClassName }
 					local tx = rd(o, "Text")
 					if type(tx) == "string" and tx ~= "" then h.text = U.clean(tx) end
-					hits[#hits + 1] = h
+					if o:IsA("GuiButton") then h.btn = true; btns[#btns + 1] = h else others[#others + 1] = h end
 				end
 			end
+			local hits = {}
+			for _, h in ipairs(btns) do if #hits < 4 then hits[#hits + 1] = h end end
+			for _, h in ipairs(others) do if #hits < 4 then hits[#hits + 1] = h end end
 			if #hits > 0 then rec.hits = hits end
 		end
 		D.clicks[#D.clicks + 1] = rec
@@ -622,8 +629,7 @@ local function scanUI()
 		end
 	end
 	local now = os.clock()
-	local ctxBest = ""
-	local ctxLabel
+	local page, container -- open menu: the segment right after "ActivePage" (Index, Shop, Crafting...), or the ActivePage container itself
 	while #stack > 0 do
 		local node = table.remove(stack)
 		if not node:IsA("GuiObject") then
@@ -635,7 +641,10 @@ local function scanUI()
 			local descend = true
 			if big then
 				local label = relPath(node, PlayerGui)
-				if string.find(label, "ActivePage", 1, true) and #label > #ctxBest then ctxBest = label; ctxLabel = label end
+				if not page then
+					local pg = string.match(label, "ActivePage%.([^%.]+)")
+					if pg then page = pg elseif string.find(label, "ActivePage", 1, true) then container = container or label end
+				end
 				if not covered[node] then
 					descend = false
 					local t0 = pending[node]
@@ -659,10 +668,10 @@ local function scanUI()
 		end
 		slice()
 	end
-	if ctxLabel then
-		local short = string.gsub(ctxLabel, "^MainScreen%.Center%.", "")
-		if labelChild[ctxLabel] then short = short .. "/" .. labelChild[ctxLabel] end
-		Core.state.ctx = short
+	if page then
+		Core.state.ctx = page
+	elseif container then
+		Core.state.ctx = labelChild[container] or "ActivePage"
 	else
 		Core.state.ctx = nil
 	end
