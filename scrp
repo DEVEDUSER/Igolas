@@ -13,7 +13,7 @@ local typeof = ENV.UBG_TYPEOF or typeof
 if not TEST and type(ENV.UBG_CLEANUP) == "function" then pcall(ENV.UBG_CLEANUP) end
 
 local CFG = {
-	VERSION = "1.0.1", OUT = "UnboxingGap",
+	VERSION = "1.0.2", OUT = "UnboxingGap",
 	SLICE = 0.006,
 	UI_MAX_NODES = 6000, UI_MIN_NODES = 6, UI_MIN_FRAC = 0.18, UI_SETTLE = 0.6, UI_SCAN = 0.7,
 	BOX_RADIUS = 80, BOX_SCAN = 1.5, BOX_EVENT_CAP = 600, BOX_TOTAL_CAP = 40000, BOX_WATCH_PER = 60,
@@ -687,11 +687,26 @@ local function watchBox(inst, kind)
 	b.tool = equipped(); b.player_pos = rootPos(); b.player_attrs = U.attributes(LocalPlayer)
 	boxes[inst] = b
 	D.boxes[#D.boxes + 1] = b
-	connect(inst.AttributeChanged, function(name) boxEvent(b, "attr", { name = name, v = U.encodeSimple(inst:GetAttribute(name)) }) end)
+	-- first real run: 90% of the events were spawn-animation noise (size/position tweens) and the game's own FrozenBox bookkeeping.
+	-- Those are counted per box (b.counts) and only the first few are stored.
+	b.counts = {}
+	local function counted(kind, keep, data)
+		local n = (b.counts[kind] or 0) + 1
+		b.counts[kind] = n
+		if n <= keep then boxEvent(b, kind, data) end
+	end
+	connect(inst.AttributeChanged, function(name)
+		if name == "FrozenBoxUid" or name == "FrozenAt" then
+			b.counts[name] = (b.counts[name] or 0) + 1
+			if (b.counts[name] or 0) <= 2 then boxEvent(b, "attr", { name = name, v = U.encodeSimple(inst:GetAttribute(name)) }) end
+		else
+			boxEvent(b, "attr", { name = name, v = U.encodeSimple(inst:GetAttribute(name)) })
+		end
+	end)
 	if inst:IsA("BasePart") then
 		connect(inst:GetPropertyChangedSignal("Transparency"), function() boxEvent(b, "transparency", { v = U.num(rd(inst, "Transparency")) }) end)
-		connect(inst:GetPropertyChangedSignal("Size"), function() boxEvent(b, "size", { v = U.v3(rd(inst, "Size")) }) end)
-		connect(inst:GetPropertyChangedSignal("Position"), function() boxEvent(b, "moved", { v = U.v3(rd(inst, "Position")) }) end)
+		connect(inst:GetPropertyChangedSignal("Size"), function() counted("size", 6, { v = U.v3(rd(inst, "Size")) }) end)
+		connect(inst:GetPropertyChangedSignal("Position"), function() counted("moved", 6, { v = U.v3(rd(inst, "Position")) }) end)
 	end
 	for _, d in ipairs(inst:GetDescendants()) do
 		if b.nwatch >= CFG.BOX_WATCH_PER then break end
